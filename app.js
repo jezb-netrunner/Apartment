@@ -434,6 +434,7 @@ function renderActionRequired() {
         <div class="action-tenant">${esc(it.tenant.name)} &nbsp;·&nbsp; Unit ${esc(it.tenant.unit)}${it.bill.due?' &nbsp;·&nbsp; Due '+formatDate(it.bill.due):''}${late>0?' &nbsp;·&nbsp; <span style="color:var(--rust);font-weight:600;">'+late+' day'+(late>1?'s':'')+' late</span>':''}</div>
       </div>
       <span class="action-amount">&#8369;${Math.max(0,billRemaining(it.bill)).toLocaleString()}</span>
+      <button class="btn-action-remind" onclick="copyReminder('${it.tenant.id}')" title="Copy a payment reminder for ${esc(it.tenant.name)} (all their unpaid bills)" aria-label="Copy payment reminder">&#9993;</button>
       <button class="btn-action-pay" onclick="quickMarkPaid('${it.tenant.id}',${it.bi})">Mark Paid</button>
     </div>`;}).join('');
   return `<div class="action-required">
@@ -739,7 +740,7 @@ function renderAdmin() {
       </div>
     </div>
     <div class="filter-toolbar" id="filter-toolbar">
-      <input type="search" id="tenant-search" class="filter-search" placeholder="Search name or unit&hellip;" value="${esc(filterSearch)}" oninput="filterSearch=this.value;renderRows()" aria-label="Search tenants">
+      <input type="search" id="tenant-search" class="filter-search" placeholder="Search tenant or bill&hellip;" value="${esc(filterSearch)}" oninput="filterSearch=this.value;renderRows()" aria-label="Search tenants and bills" title="Search by tenant, unit, access code, or bill (press / to focus)">
       <button class="filter-toolbar-btn${filterMonth===_currentYM()?' active':''}" onclick="setFilterThisMonth()" title="Show only bills due this month">This Month</button>
       <div style="position:relative;display:inline-block;" id="filter-popover-wrap">
         <button class="filter-toolbar-btn${hasActiveFilters()?' active':''}" onclick="toggleFilterPopover()">&#9881; Filter${hasActiveFilters()?' ('+activeFilterCount()+')':''}</button>
@@ -912,13 +913,26 @@ function renderRows() {
   // Apply tenant filter
   let filtered = filterTenantId ? tenants.filter(t=>t.id===filterTenantId) : tenants;
 
-  // Apply search (name / unit / access code)
+  // Apply search — matches tenants (name / unit / access code) OR bills
+  // (label / remark). A tenant match shows the whole tenant; a bill-only
+  // match narrows that tenant's bill list to just the matching bills, so
+  // typing "water" surfaces every water bill across all tenants.
   if (filterSearch.trim()) {
     const q = filterSearch.trim().toLowerCase();
-    filtered = filtered.filter(t =>
+    const tenantHit = t =>
       (t.name||'').toLowerCase().includes(q) ||
       (t.unit||'').toLowerCase().includes(q) ||
-      (t.code||'').toLowerCase().includes(q));
+      (t.code||'').toLowerCase().includes(q);
+    const billHit = b =>
+      (b.label||'').toLowerCase().includes(q) ||
+      (b.remark||'').toLowerCase().includes(q);
+    filtered = filtered.map(t => {
+      if (tenantHit(t)) return t;
+      const bills = t.bills.filter(billHit);
+      // _billSearch flags a narrowed copy so the card view can auto-expand
+      // the paid section when the matches are paid bills.
+      return bills.length ? {...t, bills, _billSearch: true} : null;
+    }).filter(Boolean);
   }
 
   // Apply month filter — only show tenants who have at least one bill in that month.
@@ -991,8 +1005,15 @@ function renderRows() {
     const activeBills = t.bills.filter(b=>b.status!=='paid');
     const paidBills   = t.bills.filter(b=>b.status==='paid');
     const due = activeBills.reduce((s,b)=>s+Math.max(0,billRemaining(b)),0);
-    const total = due?'&#8369;'+due.toLocaleString():`<span style="color:var(--green);font-size:13px;font-family:Inter,sans-serif">Settled</span>`;
-    const actions = `<div class="row-actions"><button class="btn-statement" style="padding:4px 10px;font-size:10px;" onclick="openStmtModalById('${t.id}')" aria-label="Generate statement">Statement</button><button class="btn-icon" onclick="openQuickBill('${t.id}')" title="Add bill" aria-label="Add bill">&#65291;</button><button class="btn-icon" onclick="openEditModal('${t.id}')" title="Edit tenant" aria-label="Edit">&#9998;</button><button class="btn-icon del" onclick="deleteTenant('${t.id}')" title="Archive tenant" aria-label="Archive">&#10005;</button></div>`;
+    // "Settled" only when the tenant TRULY owes nothing; if filters/search
+    // merely hid their unpaid bills, show a neutral dash instead.
+    const trulySettled = !orig.bills.some(b=>b.status!=='paid' && billRemaining(b)>0);
+    const total = due ? '&#8369;'+due.toLocaleString()
+      : (trulySettled
+          ? `<span style="color:var(--green);font-size:13px;font-family:Inter,sans-serif">Settled</span>`
+          : `<span style="color:var(--muted);font-size:13px;font-family:Inter,sans-serif" title="This tenant has unpaid bills hidden by the current filters">&mdash;</span>`);
+    const hasBalance = orig.bills.some(b=>b.status!=='paid' && billRemaining(b)>0);
+    const actions = `<div class="row-actions"><button class="btn-statement" style="padding:4px 10px;font-size:10px;" onclick="openStmtModalById('${t.id}')" aria-label="Generate statement">Statement</button>${hasBalance?`<button class="btn-icon" onclick="copyReminder('${t.id}')" title="Copy payment reminder" aria-label="Copy payment reminder">&#9993;</button>`:''}<button class="btn-icon" onclick="openQuickBill('${t.id}')" title="Add bill" aria-label="Add bill">&#65291;</button><button class="btn-icon" onclick="openEditModal('${t.id}')" title="Edit tenant" aria-label="Edit">&#9998;</button><button class="btn-icon del" onclick="deleteTenant('${t.id}')" title="Archive tenant" aria-label="Archive">&#10005;</button></div>`;
 
     // Active bill badges sorted by urgency, coloured by derived due-status
     const sortedActive = activeBills.slice().sort((a,b)=>getDueUrgencyScore(a)-getDueUrgencyScore(b));
@@ -1020,9 +1041,10 @@ function renderRows() {
       </div>`;}).join('');
     const hiddenPaid = paidSorted.length - PAID_LIMIT;
     const paidListId = 'paid-list-'+t.id;
-    // Open when the admin expanded it earlier, or when the Paid filter is on
-    // (filtering to paid bills and then hiding them would be baffling).
-    const paidOpen = paidFilterOn || _openPaid.has(t.id);
+    // Open when the admin expanded it earlier, when the Paid filter is on, or
+    // when a bill search matched paid bills (filtering to bills and then
+    // hiding them would be baffling).
+    const paidOpen = paidFilterOn || _openPaid.has(t.id) || (!!t._billSearch && paidBills.length > 0);
     const paidSection = paidBills.length ? `
       <div class="admin-paid-section">
         <button class="admin-paid-toggle" onclick="togglePaidSection('${t.id}',this)">
@@ -2082,6 +2104,52 @@ window.addEventListener('resize',()=>{
 });
 
 // ─────────────────────────────────────────────
+// PAYMENT REMINDER GENERATOR
+// Builds a ready-to-send message with the tenant's outstanding bills and the
+// payment instructions, and copies it to the clipboard so the landlord can
+// paste it straight into SMS / Messenger / Viber.
+// ─────────────────────────────────────────────
+function buildReminderText(t){
+  const active = t.bills
+    .filter(b=>b.status!=='paid' && Math.max(0,billRemaining(b))>0)
+    .sort((a,b)=>getDueUrgencyScore(a)-getDueUrgencyScore(b));
+  if(!active.length) return null;
+  const lines = active.map(b=>{
+    const late = daysOverdue(b);
+    const partial = billTotalPaid(b) > 0 ? ' (₱'+billTotalPaid(b).toLocaleString()+' already received)' : '';
+    return '• '+b.label+' — ₱'+Math.max(0,billRemaining(b)).toLocaleString()
+      + (b.due ? ', due '+formatDate(b.due) : '')
+      + (late>0 ? ' ('+late+' day'+(late>1?'s':'')+' overdue)' : '')
+      + partial;
+  });
+  const total = active.reduce((s,b)=>s+Math.max(0,billRemaining(b)),0);
+  return 'Hi '+t.name+', this is a friendly reminder from Orange Apartment.\n\n'
+    + 'Outstanding bills for Unit '+t.unit+':\n'
+    + lines.join('\n') + '\n\n'
+    + 'Total due: ₱'+total.toLocaleString()
+    + (paymentInstructions ? '\n\nHow to pay:\n'+paymentInstructions : '')
+    + '\n\nThank you!';
+}
+async function copyReminder(tid){
+  const t = tenants.find(t=>t.id===tid); if(!t) return;
+  const text = buildReminderText(t);
+  if(!text){ showToast('No outstanding balance for '+t.name+'.'); return; }
+  try {
+    await navigator.clipboard.writeText(text);
+    showToast('Reminder for '+t.name+' copied — paste into SMS / Messenger / Viber.');
+  } catch {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;left:-9999px;';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); showToast('Reminder for '+t.name+' copied — paste into SMS / Messenger / Viber.'); }
+    catch { showToast('Could not copy automatically.', false); }
+    ta.remove();
+  }
+}
+
+// ─────────────────────────────────────────────
 // QUICK MARK PAID (from Action Required)
 // ─────────────────────────────────────────────
 function quickMarkPaid(tid, bi) {
@@ -2557,6 +2625,20 @@ function exportCSV() {
   URL.revokeObjectURL(url);
   showToast('CSV exported ✓');
 }
+
+// ─────────────────────────────────────────────
+// "/" focuses the dashboard search box (unless already typing somewhere)
+// ─────────────────────────────────────────────
+document.addEventListener('keydown', function(e) {
+  if(e.key !== '/') return;
+  const el = document.getElementById('tenant-search');
+  if(!el) return;
+  const a = document.activeElement;
+  if(a && (a.tagName==='INPUT' || a.tagName==='TEXTAREA' || a.tagName==='SELECT' || a.isContentEditable)) return;
+  e.preventDefault();
+  el.focus();
+  el.select();
+});
 
 // ─────────────────────────────────────────────
 // F16: Escape key closes modals

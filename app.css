@@ -443,6 +443,13 @@ main { flex: 1; padding: 52px 40px; max-width: 1120px; margin: 0 auto; width: 10
   cursor: pointer; transition: background 0.15s; flex-shrink: 0; font-family: 'Inter', sans-serif;
 }
 .btn-action-pay:hover { background: #3558d0; }
+.btn-action-remind {
+  font-size: 13px; font-weight: 600; padding: 5px 10px;
+  background: var(--white); color: var(--navy);
+  border: 1.5px solid var(--border); border-radius: 6px;
+  cursor: pointer; transition: all 0.15s; flex-shrink: 0; font-family: 'Inter', sans-serif;
+}
+.btn-action-remind:hover { border-color: var(--blue); color: var(--blue); background: rgba(65,105,225,0.05); }
 
 /* VIEW TOGGLE */
 .view-toggle { display: inline-flex; border: 1.5px solid var(--border); border-radius: 6px; overflow: hidden; margin-left: 12px; }
