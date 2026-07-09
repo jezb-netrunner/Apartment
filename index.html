@@ -3,7 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src https://bxzfqjspoyvwosmpgeof.supabase.co; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src https://bxzfqjspoyvwosmpgeof.supabase.co; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';">
+<meta name="referrer" content="no-referrer">
 <meta name="robots" content="noindex, nofollow">
 <meta name="description" content="Tenant billing portal for Orange Apartment, Baguio">
 <meta name="theme-color" content="#4169e1">
@@ -45,7 +46,7 @@
     <div id="tenant-form" style="display:none">
       <div class="field">
         <label for="tenant-code">Access Code</label>
-        <input type="text" id="tenant-code" autocomplete="one-time-code" placeholder="e.g. XKQR-A7BN" style="letter-spacing:0.1em;text-transform:uppercase" oninput="this.value=this.value.toUpperCase()" onkeydown="if(event.key==='Enter')tenantLogin()">
+        <input type="text" id="tenant-code" autocomplete="one-time-code" maxlength="20" placeholder="e.g. XKQR-A7BN" style="letter-spacing:0.1em;text-transform:uppercase" oninput="this.value=this.value.toUpperCase()" onkeydown="if(event.key==='Enter')tenantLogin()">
       </div>
       <button class="btn-primary" onclick="tenantLogin()">View My Bills</button>
     </div>
@@ -79,17 +80,17 @@
     </div>
     <div class="modal-panel active" id="panel-info">
       <div class="form-grid">
-        <div class="field"><label for="m-name">Full Name</label><input type="text" id="m-name" placeholder="e.g. Maria Santos"></div>
-        <div class="field"><label for="m-unit">Unit Number</label><input type="text" id="m-unit" placeholder="e.g. 301"></div>
+        <div class="field"><label for="m-name">Full Name</label><input type="text" id="m-name" maxlength="80" placeholder="e.g. Maria Santos"></div>
+        <div class="field"><label for="m-unit">Unit Number</label><input type="text" id="m-unit" maxlength="40" placeholder="e.g. 301"></div>
         <div class="field full">
           <label for="m-code">Access Code</label>
           <div class="code-row">
-            <input type="text" id="m-code" placeholder="Auto-generated" style="letter-spacing:0.1em;text-transform:uppercase" oninput="this.value=this.value.toUpperCase()">
+            <input type="text" id="m-code" maxlength="20" placeholder="Auto-generated" style="letter-spacing:0.1em;text-transform:uppercase" oninput="this.value=this.value.toUpperCase()">
             <button class="btn-gen" onclick="generateCode()">Generate</button>
           </div>
         </div>
-        <div class="field"><label for="m-phone">Phone <span style="font-weight:400;color:var(--muted)">(optional)</span></label><input type="text" id="m-phone" placeholder="e.g. 0917 123 4567"></div>
-        <div class="field"><label for="m-email">Email <span style="font-weight:400;color:var(--muted)">(optional)</span></label><input type="email" id="m-email" placeholder="e.g. tenant@email.com"></div>
+        <div class="field"><label for="m-phone">Phone <span style="font-weight:400;color:var(--muted)">(optional)</span></label><input type="text" id="m-phone" maxlength="30" placeholder="e.g. 0917 123 4567"></div>
+        <div class="field"><label for="m-email">Email <span style="font-weight:400;color:var(--muted)">(optional)</span></label><input type="email" id="m-email" maxlength="120" placeholder="e.g. tenant@email.com"></div>
         <div class="field"><label for="m-movein">Move-in Date <span style="font-weight:400;color:var(--muted)">(optional)</span></label><input type="date" id="m-movein"></div>
       </div>
       <div id="new-tenant-bills">
@@ -100,10 +101,11 @@
       </div>
       <div class="modal-actions">
         <button class="btn-cancel" onclick="closeModal()">Cancel</button>
-        <button class="btn-save" onclick="saveTenant()">Save tenant</button>
+        <button class="btn-save" id="btn-save-tenant" onclick="saveTenant()">Save tenant</button>
       </div>
     </div>
     <div class="modal-panel" id="panel-bills">
+      <div class="modal-tab-hint">Changes on this tab save instantly &mdash; no Save button needed.</div>
       <div id="bill-list-items"></div>
       <button class="btn-add-bill" id="btn-start-new-bill" onclick="startNewBill()">+ Add new bill</button>
       <div id="new-bill-inline" style="display:none"></div>
@@ -113,6 +115,7 @@
     </div>
 
     <div class="modal-panel" id="panel-templates">
+      <div class="modal-tab-hint">Changes on this tab save instantly &mdash; no Save button needed.</div>
       <p style="font-size:12px;color:var(--muted);margin-bottom:16px;line-height:1.6;">
         Templates auto-generate recurring bills each month. Set a label, amount, and the day of month it's due.
       </p>
@@ -167,6 +170,42 @@
   </div>
 </div>
 
+<!-- QUICK ADD BILL MODAL -->
+<div id="addbill-modal" role="dialog" aria-modal="true" aria-labelledby="addbill-title">
+  <div class="qb-box">
+    <div class="qb-eyebrow">Billing</div>
+    <div class="qb-title" id="addbill-title">Add a bill</div>
+    <div class="form-grid">
+      <div class="field full">
+        <label for="qb-tenant">Tenant</label>
+        <select id="qb-tenant"></select>
+      </div>
+      <div class="field full">
+        <label for="qb-label">Description</label>
+        <input type="text" id="qb-label" list="qb-label-suggestions" maxlength="80" placeholder="e.g. Monthly Rent" autocomplete="off" onchange="qbAutofill()" onblur="qbAutofill()">
+        <datalist id="qb-label-suggestions"></datalist>
+      </div>
+      <div class="field"><label for="qb-amount">Amount (&#8369;)</label><input type="text" id="qb-amount" placeholder="0" inputmode="decimal" autocomplete="off"></div>
+      <div class="field"><label for="qb-due">Due Date</label><input type="date" id="qb-due"></div>
+      <div class="field full" style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
+        <input type="checkbox" id="qb-paid" onchange="qbTogglePaid(this)" style="width:15px;height:15px;accent-color:var(--blue);cursor:pointer;">
+        <label for="qb-paid" style="margin-bottom:0;cursor:pointer;">Already paid</label>
+      </div>
+      <div class="field full" id="qb-paiddate-wrap" style="display:none"><label for="qb-paiddate">Date Paid</label><input type="date" id="qb-paiddate"></div>
+    </div>
+    <details class="qb-more" id="qb-more">
+      <summary>More options</summary>
+      <div class="field"><label for="qb-remark">Remark <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted)">(optional)</span></label><input type="text" id="qb-remark" maxlength="200" placeholder="e.g. Penalties apply"></div>
+      <div class="field"><label for="qb-scan">Google Drive Scan Link <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted)">(optional)</span></label><input type="text" id="qb-scan" placeholder="https://drive.google.com/..."></div>
+    </details>
+    <div class="qb-actions">
+      <button class="btn-cancel" onclick="closeQuickBill()">Cancel</button>
+      <button class="btn-qb-another" onclick="saveQuickBill(true)" title="Save this bill and keep the form open">Save + another</button>
+      <button class="btn-save" onclick="saveQuickBill(false)">Add Bill</button>
+    </div>
+  </div>
+</div>
+
 <!-- PAID DATE MODAL -->
 <div id="paiddate-modal" role="dialog" aria-modal="true" aria-labelledby="paiddate-bill-name">
   <div class="paiddate-box">
@@ -200,7 +239,9 @@
 </div>
 
 
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js" crossorigin="anonymous"></script>
+<!-- supabase-js v2.45.4 vendored from the official npm package (dist/umd/supabase.js)
+     so the portal keeps working if the CDN is down and CSP can stay 'self'-only. -->
+<script src="vendor/supabase-js-2.45.4.min.js"></script>
 <script src="app.js" defer></script>
 
 </body>
