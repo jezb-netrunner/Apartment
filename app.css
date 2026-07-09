@@ -193,10 +193,13 @@ main { flex: 1; padding: 52px 40px; max-width: 1120px; margin: 0 auto; width: 10
 
 /* STATS */
 .summary-strip {
-  display: grid; grid-template-columns: repeat(3, 1fr);
+  display: grid; grid-template-columns: repeat(5, 1fr);
   gap: 1px; background: var(--border);
   border: 1px solid var(--border); border-radius: 10px;
   overflow: hidden; margin-bottom: 48px; box-shadow: var(--shadow-sm);
+}
+@media (max-width: 1000px) and (min-width: 769px) {
+  .summary-strip { grid-template-columns: repeat(3, 1fr); }
 }
 .summary-stat { background: var(--white); padding: 22px 28px; }
 .stat-label {
@@ -207,7 +210,10 @@ main { flex: 1; padding: 52px 40px; max-width: 1120px; margin: 0 auto; width: 10
   font-family: 'Source Serif 4', serif; font-size: 28px;
   font-weight: 600; color: var(--ink); letter-spacing: -0.02em;
 }
-.stat-value.blue { color: var(--blue); }
+.stat-value.blue  { color: var(--blue); }
+.stat-value.green { color: var(--green); }
+.stat-value.rust  { color: var(--rust); }
+.stat-sub { font-size: 11px; color: var(--muted); margin-top: 4px; font-weight: 400; }
 
 /* TABLE */
 .section-bar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
@@ -258,6 +264,12 @@ main { flex: 1; padding: 52px 40px; max-width: 1120px; margin: 0 auto; width: 10
 .status-paid    { background: #e8f5e9; color: var(--green); }
 .status-unpaid  { background: #fdecea; color: var(--rust); }
 .status-overdue { background: #fff3e0; color: var(--orange-text); }
+/* Derived due-status badge colours: red = overdue/due today, orange = due soon,
+   slate = upcoming/unscheduled, green = paid. */
+.ds-overdue  { background: #fdecea; color: var(--rust); }
+.ds-due      { background: #fff3e0; color: var(--orange-text); }
+.ds-upcoming { background: #eef2f7; color: var(--muted); }
+.ds-paid     { background: #e8f5e9; color: var(--green); }
 .row-total { font-family: 'Source Serif 4', serif; font-size: 16px; font-weight: 600; color: var(--ink); }
 .row-actions { display: flex; gap: 6px; justify-content: flex-end; }
 .btn-icon {
@@ -497,9 +509,10 @@ main { flex: 1; padding: 52px 40px; max-width: 1120px; margin: 0 auto; width: 10
 .insights-body { padding-top: 8px; }
 .insights-grid {
   display: grid;
-  grid-template-columns: 1.6fr 1fr 1.4fr;
+  grid-template-columns: 1.6fr 1fr;
   gap: 14px;
 }
+.cg-bar-fill-aging { background: linear-gradient(90deg, var(--rust), #d9695c); }
 .insights-card {
   background: var(--white);
   border: 1px solid var(--border);
@@ -723,6 +736,65 @@ main { flex: 1; padding: 52px 40px; max-width: 1120px; margin: 0 auto; width: 10
   font-family: 'Inter', sans-serif;
 }
 .admin-paid-revert:hover { border-color: var(--rust); color: var(--rust); }
+
+/* QUICK ADD BILL MODAL */
+#addbill-modal {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(17,17,17,0.5);
+  backdrop-filter: blur(4px);
+  z-index: 2000;
+  align-items: center;
+  justify-content: center;
+}
+#addbill-modal.open { display: flex !important; }
+.qb-box {
+  background: var(--white);
+  border-radius: 12px;
+  padding: 28px;
+  width: 100%;
+  max-width: 460px;
+  max-height: 90vh;
+  overflow-y: auto;
+  box-shadow: 0 24px 64px rgba(17,17,17,0.2);
+  animation: rise 0.25s cubic-bezier(.16,1,.3,1);
+}
+.qb-eyebrow { font-size: 10px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: var(--blue); margin-bottom: 6px; }
+.qb-title { font-family: 'Source Serif 4', serif; font-size: 20px; font-weight: 600; color: var(--ink); margin-bottom: 20px; letter-spacing: -0.01em; }
+.qb-more { margin-bottom: 6px; }
+.qb-more summary {
+  font-size: 11px; font-weight: 600; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--muted); cursor: pointer;
+  padding: 4px 0 10px; user-select: none;
+}
+.qb-more summary:hover { color: var(--blue); }
+.qb-actions { display: flex; gap: 8px; margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
+.qb-actions .btn-cancel { flex: 1; padding: 11px; }
+.qb-actions .btn-save { flex: 1.4; padding: 11px; }
+.btn-qb-another {
+  flex: 1.2; padding: 11px; background: var(--white);
+  border: 1.5px solid var(--blue); border-radius: 6px;
+  font-family: 'Inter', sans-serif; font-size: 12px; font-weight: 600;
+  color: var(--blue); cursor: pointer; transition: all 0.15s; white-space: nowrap;
+}
+.btn-qb-another:hover { background: #eef2ff; }
+@media (max-width: 480px) {
+  .qb-actions { flex-wrap: wrap; }
+  .qb-actions .btn-cancel { flex: 1 1 100%; order: 3; }
+}
+
+/* Instant-save hint inside the edit-tenant modal tabs */
+.modal-tab-hint {
+  font-size: 11px;
+  color: var(--green);
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: 6px;
+  padding: 7px 10px;
+  margin-bottom: 14px;
+  font-weight: 500;
+}
 
 /* PAID DATE MODAL */
 #paiddate-modal {
@@ -1206,6 +1278,29 @@ main { flex: 1; padding: 52px 40px; max-width: 1120px; margin: 0 auto; width: 10
 }
 .sort-option:hover { background: var(--bg); }
 .sort-option.active { color: var(--blue); font-weight: 600; }
+.sort-toolbar-btn.active {
+  border-color: var(--blue);
+  background: #eef2ff;
+  color: var(--blue);
+  font-weight: 600;
+}
+.filter-search {
+  font-family: 'Inter', sans-serif;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink);
+  background: var(--white);
+  border: 1.5px solid var(--border);
+  border-radius: 7px;
+  padding: 5px 10px !important;
+  width: 190px !important;
+  transition: border-color 0.15s, width 0.2s;
+}
+.filter-search:focus { border-color: var(--blue); box-shadow: none; width: 230px !important; }
+@media (max-width: 768px) {
+  .filter-search { width: 100% !important; }
+  .filter-search:focus { width: 100% !important; }
+}
 .filter-result-note {
   font-size: 12px;
   color: var(--muted);

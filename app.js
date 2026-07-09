@@ -21,38 +21,25 @@ function openAddPayment(bi) {
 }
 
 async function savePaymentEntry(bi) {
-  const amt  = Number(document.getElementById('pf-amount-'+bi).value);
+  const amt  = normalizeAmount(document.getElementById('pf-amount-'+bi).value);
   const date = document.getElementById('pf-date-'+bi).value;
   const note = document.getElementById('pf-note-'+bi).value.trim();
   if(!amt||amt<=0){ showToast('Please enter a valid amount.',false); return; }
   if(!date){ showToast('Please select a date.',false); return; }
-  const t = tenants.find(t=>t.id===editingId);
-  const billsCopy = structuredClone(t.bills);
-  if(!billsCopy[bi].payments) billsCopy[bi].payments = [];
-  billsCopy[bi].payments.push({amount:amt, date, note});
-  try {
-    await dbUpdate(t.id,{bills:billsCopy});
-    t.bills = billsCopy;
-    tenants = tenants.map(x=>x.id===t.id?t:x);
-    showToast('Payment recorded.');
-    renderBillListItems();
-    renderAdmin();
-  } catch(e){ showToast('Save failed: '+e.message,false); }
+  const ok = await saveBills(editingId, bills=>{
+    if(!bills[bi]) return;
+    if(!bills[bi].payments) bills[bi].payments = [];
+    bills[bi].payments.push({amount:amt, date, note});
+  }, 'Payment recorded.');
+  if(ok){ renderBillListItems(); rerenderAdmin(); }
 }
 
 async function deletePaymentEntry(bi, pi) {
   if(!confirm('Remove this payment entry?')) return;
-  const t = tenants.find(t=>t.id===editingId);
-  const billsCopy = structuredClone(t.bills);
-  billsCopy[bi].payments.splice(pi,1);
-  try {
-    await dbUpdate(t.id,{bills:billsCopy});
-    t.bills = billsCopy;
-    tenants = tenants.map(x=>x.id===t.id?t:x);
-    showToast('Payment entry removed.');
-    renderBillListItems();
-    renderAdmin();
-  } catch(e){ showToast('Save failed: '+e.message,false); }
+  const ok = await saveBills(editingId, bills=>{
+    if(bills[bi] && bills[bi].payments) bills[bi].payments.splice(pi,1);
+  }, 'Payment entry removed.');
+  if(ok){ renderBillListItems(); rerenderAdmin(); }
 }
 
 
@@ -220,12 +207,23 @@ let editingId = null;
 let filterTenantId = '';   // '' = all
 let filterMonth    = '';   // '' = all, else 'YYYY-MM'
 let filterStatuses = [];   // [] = show all; else subset of ['overdue','due-soon','due-today','upcoming','paid']
-let sortOrder      = 'unit-asc'; // 'unit-asc' | 'unit-desc' | 'name-asc'
+let filterSearch   = '';   // free-text search on tenant name / unit / code
+let sortOrder      = 'unit-asc'; // key of SORT_LABELS
 let viewMode       = 'card';     // 'card' | 'table'
 let tableSortCol   = 'due';      // column to sort table by
 let tableSortDir   = 'asc';      // 'asc' | 'desc'
 let portalMonth    = 'current'; // 'all' | 'YYYY-MM' | 'current'
 let billForms = [];
+let _openPaid = new Set();  // tenant ids whose "Paid" section is expanded
+
+const SORT_LABELS = {
+  'unit-asc':     'Unit &#8593;',
+  'unit-desc':    'Unit &#8595;',
+  'name-asc':     'Name A&ndash;Z',
+  'balance-desc': 'Balance high &rarr; low',
+  'balance-asc':  'Balance low &rarr; high',
+  'urgency':      'Most urgent first'
+};
 
 function setLoading(on, msg='Loading…') {
   let el = document.getElementById('loading-overlay');
@@ -325,19 +323,23 @@ async function tenantLogin() {
   const code = document.getElementById('tenant-code').value.trim().toUpperCase();
   document.getElementById('login-error').textContent = '';
   if(!code){ document.getElementById('login-error').textContent = 'Please enter your access code.'; return; }
-  _loginAttempts.count++;
-  if(_loginAttempts.count >= 5) {
-    _loginAttempts.lockedUntil = now + 60000;
-    _loginAttempts.count = 0;
-    document.getElementById('login-error').textContent = 'Too many failed attempts. Please wait 1 minute.';
-    return;
-  }
   setLoading(true,'Verifying code…');
   try {
     const rows = await sbFetch('rpc/login_tenant', { method:'POST', body: JSON.stringify({ access_code: code }) });
     setLoading(false);
     if(rows && rows.length) { _loginAttempts.count = 0; currentUser=rows[0]; tenants=rows; showApp(); }
-    else document.getElementById('login-error').textContent = 'That access code was not found.';
+    else {
+      // Count only FAILED attempts; lock after the 5th failure. (The server
+      // enforces the real rate limit — this just gives fast local feedback.)
+      _loginAttempts.count++;
+      if(_loginAttempts.count >= 5) {
+        _loginAttempts.lockedUntil = now + 60000;
+        _loginAttempts.count = 0;
+        document.getElementById('login-error').textContent = 'Too many failed attempts. Please wait 1 minute.';
+        return;
+      }
+      document.getElementById('login-error').textContent = 'That access code was not found.';
+    }
   } catch(e) {
     setLoading(false);
     const msg = (e.message && e.message.includes('Too many')) ? 'Too many attempts. Please wait and try again.' : 'Connection error. Please try again.';
@@ -345,23 +347,9 @@ async function tenantLogin() {
   }
 }
 
-// Auto-mark unpaid bills past their due date as Overdue, sync any changes to Supabase
-async function checkAndSyncOverdue() {
-  const today = new Date(); today.setHours(0,0,0,0);
-  const updates = [];
-  tenants.forEach(t => {
-    const billsCopy = structuredClone(t.bills);
-    let changed = false;
-    billsCopy.forEach(b => {
-      if (b.status === 'unpaid' && b.due) {
-        const due = new Date(b.due); due.setHours(0,0,0,0);
-        if (due < today) { b.status = 'overdue'; changed = true; }
-      }
-    });
-    if (changed) updates.push(dbUpdate(t.id, { bills: billsCopy }).then(() => { t.bills = billsCopy; }));
-  });
-  if (updates.length) await Promise.all(updates);
-}
+// Overdue is DERIVED from the due date at render time (see getDueStatus), so the
+// stored status only distinguishes 'paid' vs everything else. Legacy rows that
+// still say 'overdue' are treated exactly like 'unpaid'; no sync writes needed.
 
 async function showApp() {
   document.getElementById('login-screen').style.display='none';
@@ -371,7 +359,6 @@ async function showApp() {
     setLoading(true,'Loading tenants…');
     try {
       tenants = await dbGetAll() || [];
-      await checkAndSyncOverdue();
       paymentInstructions = await dbGetSetting('payment_instructions');
     } catch(e) {
       setLoading(false);
@@ -399,6 +386,8 @@ async function logout() {
   filterTenantId = '';
   filterMonth    = '';
   filterStatuses = [];
+  filterSearch   = '';
+  _openPaid      = new Set();
   sortOrder      = 'unit-asc';
   viewMode       = 'card';
   tableSortCol   = 'due';
@@ -435,16 +424,18 @@ function renderActionRequired() {
     if(b.type==='overdue'&&a.type!=='overdue') return 1;
     return (a.bill.due||'')<(b.bill.due||'')?-1:1;
   });
-  const rows = items.map(it=>`
+  const rows = items.map(it=>{
+    const late = daysOverdue(it.bill);
+    return `
     <div class="action-item">
       <span class="action-badge ${it.type}">${it.label}</span>
       <div class="action-info">
         <div class="action-bill-name">${esc(it.bill.label)}</div>
-        <div class="action-tenant">${esc(it.tenant.name)} &nbsp;·&nbsp; Unit ${esc(it.tenant.unit)}${it.bill.due?' &nbsp;·&nbsp; Due '+formatDate(it.bill.due):''}</div>
+        <div class="action-tenant">${esc(it.tenant.name)} &nbsp;·&nbsp; Unit ${esc(it.tenant.unit)}${it.bill.due?' &nbsp;·&nbsp; Due '+formatDate(it.bill.due):''}${late>0?' &nbsp;·&nbsp; <span style="color:var(--rust);font-weight:600;">'+late+' day'+(late>1?'s':'')+' late</span>':''}</div>
       </div>
       <span class="action-amount">&#8369;${Math.max(0,billRemaining(it.bill)).toLocaleString()}</span>
       <button class="btn-action-pay" onclick="quickMarkPaid('${it.tenant.id}',${it.bi})">Mark Paid</button>
-    </div>`).join('');
+    </div>`;}).join('');
   return `<div class="action-required">
     <div class="action-header">
       <div class="action-header-left"><div class="action-dot"></div><div class="action-title">Action Required</div></div>
@@ -459,7 +450,7 @@ function renderActionRequired() {
 let _insightsOpen = true;
 function toggleInsights() {
   _insightsOpen = !_insightsOpen;
-  renderAdmin();
+  rerenderAdmin();
 }
 // Three small SVG charts:
 //  1. 6-month line: ₱ billed vs ₱ collected per month
@@ -482,17 +473,19 @@ function _last6Months() {
   }
   return out;
 }
-// "Collected in month M" = sum of payment-log entries dated in M, plus the
-// full amount of any bill marked paid in M with no payment-log entries
-// (back-compat for bills that pre-date the payment log).
+// "Collected in month M" = payment-log entries dated in M, plus — for bills
+// marked paid in M — whatever part of the amount is NOT covered by logged
+// payments (the remainder settled at mark-paid time). This also covers legacy
+// bills with no payment log at all (remainder = full amount).
 function _collectedInMonth(ym) {
   let total = 0;
   tenants.forEach(t => (t.bills||[]).forEach(b => {
     const payments = b.payments || [];
-    if(payments.length){
-      payments.forEach(p => { if(p.date && p.date.startsWith(ym)) total += Number(p.amount)||0; });
-    } else if(b.status==='paid' && b.paidDate && b.paidDate.startsWith(ym)){
-      total += Number(b.amount)||0;
+    payments.forEach(p => { if(p.date && String(p.date).startsWith(ym)) total += Number(p.amount)||0; });
+    if(b.status==='paid' && b.paidDate && String(b.paidDate).startsWith(ym)){
+      const logged = payments.reduce((s,p)=>s+(Number(p.amount)||0),0);
+      const residual = (Number(b.amount)||0) - logged;
+      if(residual > 0) total += residual;
     }
   }));
   return total;
@@ -545,10 +538,18 @@ function renderInsights() {
     + '</svg>';
 
   // ── 2. Status donut ──
-  // Count active bills + paid (this month) for a snapshot of where things stand.
-  const statusCounts = { overdue:0, 'due-today':0, 'due-soon':0, upcoming:0, 'no-date':0, paid:0 };
+  // Snapshot of the current workload: all ACTIVE bills by urgency, plus bills
+  // paid this month (so progress is visible without drowning in years of
+  // historical paid bills).
+  const curYM = _currentYM();
+  const statusCounts = { overdue:0, 'due-today':0, 'due-soon':0, upcoming:0, 'no-date':0 };
+  let paidThisMonth = 0;
   tenants.forEach(t => (t.bills||[]).forEach(b => {
     const ds = getDueStatus(b);
+    if(ds === 'paid'){
+      if(b.paidDate && String(b.paidDate).startsWith(curYM)) paidThisMonth++;
+      return;
+    }
     if(statusCounts[ds] !== undefined) statusCounts[ds]++;
   }));
   // Combine due-today into overdue colour group for visual clarity (both red).
@@ -556,7 +557,7 @@ function renderInsights() {
     { key:'overdue',  label:'Overdue',   value: statusCounts.overdue + statusCounts['due-today'], color:'#c0392b' },
     { key:'due-soon', label:'Due Soon',  value: statusCounts['due-soon'], color:'#e67e22' },
     { key:'upcoming', label:'Upcoming',  value: statusCounts.upcoming + statusCounts['no-date'], color:'#5b88e6' },
-    { key:'paid',     label:'Paid',      value: statusCounts.paid, color:'#1e8449' }
+    { key:'paid',     label:'Paid this month', value: paidThisMonth, color:'#1e8449' }
   ];
   const donutTotal = donutSlices.reduce((s,x)=>s+x.value, 0);
   const DW = 180, DH = 180, DCx = 90, DCy = 90, Rout = 70, Rin = 44;
@@ -622,6 +623,35 @@ function renderInsights() {
       + '</div>';
   }
 
+  // ── 4. Overdue aging buckets ──
+  // How long has overdue money been sitting? Buckets by days past due.
+  const agingBuckets = [
+    { label: '1–30 days',  min: 1,  max: 30,  count: 0, amt: 0 },
+    { label: '31–60 days', min: 31, max: 60,  count: 0, amt: 0 },
+    { label: '60+ days',   min: 61, max: 1e9, count: 0, amt: 0 }
+  ];
+  tenants.forEach(t => (t.bills||[]).forEach(b => {
+    if(b.status==='paid') return;
+    const d = daysOverdue(b);
+    if(d < 1) return;
+    const bk = agingBuckets.find(x => d >= x.min && d <= x.max);
+    if(bk){ bk.count++; bk.amt += Math.max(0, billRemaining(b)); }
+  }));
+  const agingMax = Math.max(1, ...agingBuckets.map(x=>x.amt));
+  const agingTotal = agingBuckets.reduce((s,x)=>s+x.amt,0);
+  const agingHtml = agingTotal === 0
+    ? '<div class="cg-bar-empty">Nothing overdue. All caught up.</div>'
+    : '<div class="cg-bars">'
+      + agingBuckets.map(x => {
+          const pct = (x.amt / agingMax * 100).toFixed(1);
+          return '<div class="cg-bar-row" onclick="filterStatuses=[\'overdue\'];applyFilters()" title="Show overdue bills">'
+               + '<div class="cg-bar-name">'+x.label+' <span class="cg-bar-unit">· '+x.count+' bill'+(x.count!==1?'s':'')+'</span></div>'
+               + '<div class="cg-bar-track"><div class="cg-bar-fill cg-bar-fill-aging" style="width:'+pct+'%"></div></div>'
+               + '<div class="cg-bar-val">&#8369;'+x.amt.toLocaleString()+'</div>'
+               + '</div>';
+        }).join('')
+      + '</div>';
+
   // ── Compose panel ──
   return '<div class="insights-panel" id="insights-panel">'
     + '<button class="insights-toggle" onclick="toggleInsights()" aria-expanded="'+(_insightsOpen?'true':'false')+'">'
@@ -639,13 +669,17 @@ function renderInsights() {
           +     '</div>'
           +   '</div>'
           +   '<div class="insights-card insights-card-donut">'
-          +     '<div class="insights-card-title">Bill Status</div>'
+          +     '<div class="insights-card-title">Bill Status <span class="insights-card-sub">active + paid this month</span></div>'
           +     donutSvg
           +     donutLegend
           +   '</div>'
           +   '<div class="insights-card insights-card-bars">'
           +     '<div class="insights-card-title">Top Outstanding <span class="insights-card-sub">click to filter</span></div>'
           +     barSvg
+          +   '</div>'
+          +   '<div class="insights-card insights-card-aging">'
+          +     '<div class="insights-card-title">Overdue Aging <span class="insights-card-sub">how long money has been owed</span></div>'
+          +     agingHtml
           +   '</div>'
           + '</div>'
           + '</div>'
@@ -654,16 +688,29 @@ function renderInsights() {
 }
 
 function renderAdmin() {
-  const totalDue = tenants.reduce((s,t)=>s+t.bills.filter(b=>b.status!=='paid').reduce((a,b)=>a+Math.max(0,billRemaining(b)),0),0);
-  const unpaid   = tenants.reduce((s,t)=>s+t.bills.filter(b=>b.status==='unpaid'||b.status==='overdue').length,0);
+  const curYM = _currentYM();
+  const monthLabel = new Date().toLocaleString('default',{month:'short'});
+  let totalDue=0, unpaidCount=0, overdueDue=0, overdueCount=0;
+  tenants.forEach(t=>t.bills.forEach(b=>{
+    if(b.status==='paid') return;
+    const rem = Math.max(0,billRemaining(b));
+    totalDue += rem;
+    unpaidCount++;
+    if(getDueStatus(b)==='overdue'){ overdueDue+=rem; overdueCount++; }
+  }));
+  const billedThisMonth = _billedInMonth(curYM);
+  const collectedThisMonth = _collectedInMonth(curYM);
+  const rate = billedThisMonth>0 ? Math.round(collectedThisMonth/billedThisMonth*100) : null;
   const hasTemplates = tenants.some(t=>(t.templates||[]).length>0);
   document.getElementById('main-content').innerHTML=`
     <div class="page-eyebrow">Dashboard</div>
     <div class="page-title">Tenant Overview</div>
     <div class="summary-strip">
-      <div class="summary-stat"><div class="stat-label">Total Tenants</div><div class="stat-value">${tenants.length}</div></div>
-      <div class="summary-stat"><div class="stat-label">Unpaid Bills</div><div class="stat-value">${unpaid}</div></div>
-      <div class="summary-stat"><div class="stat-label">Balance Outstanding</div><div class="stat-value blue">&#8369;${totalDue.toLocaleString()}</div></div>
+      <div class="summary-stat"><div class="stat-label">Tenants</div><div class="stat-value">${tenants.length}</div><div class="stat-sub">${unpaidCount} unpaid bill${unpaidCount!==1?'s':''}</div></div>
+      <div class="summary-stat"><div class="stat-label">Outstanding</div><div class="stat-value blue">&#8369;${totalDue.toLocaleString()}</div><div class="stat-sub">all unpaid bills</div></div>
+      <div class="summary-stat"><div class="stat-label">Overdue</div><div class="stat-value ${overdueDue>0?'rust':'green'}">${overdueDue>0?'&#8369;'+overdueDue.toLocaleString():'None'}</div><div class="stat-sub">${overdueCount>0?overdueCount+' bill'+(overdueCount!==1?'s':'')+' past due':'nothing past due'}</div></div>
+      <div class="summary-stat"><div class="stat-label">Collected &middot; ${monthLabel}</div><div class="stat-value green">&#8369;${collectedThisMonth.toLocaleString()}</div><div class="stat-sub">of &#8369;${billedThisMonth.toLocaleString()} billed</div></div>
+      <div class="summary-stat"><div class="stat-label">Collection Rate</div><div class="stat-value">${rate===null?'&mdash;':rate+'%'}</div><div class="stat-sub">collected vs billed &middot; ${monthLabel}</div></div>
     </div>
     ${renderInsights()}
     <div class="pay-inst-card">
@@ -687,24 +734,26 @@ function renderAdmin() {
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn-generate" onclick="exportCSV()" title="Export all bills to CSV">&#128190; Export CSV</button>
         ${hasTemplates?'<button class="btn-generate" onclick="openGenModal()">&#128197; Generate Bills</button>':''}
-        <button class="btn-add" onclick="openAddModal()">+ Add Tenant</button>
+        <button class="btn-generate" onclick="openAddModal()">+ Add Tenant</button>
+        <button class="btn-add" onclick="openQuickBill()">+ Add Bill</button>
       </div>
     </div>
     <div class="filter-toolbar" id="filter-toolbar">
+      <input type="search" id="tenant-search" class="filter-search" placeholder="Search name or unit&hellip;" value="${esc(filterSearch)}" oninput="filterSearch=this.value;renderRows()" aria-label="Search tenants">
       <button class="filter-toolbar-btn${filterMonth===_currentYM()?' active':''}" onclick="setFilterThisMonth()" title="Show only bills due this month">This Month</button>
       <div style="position:relative;display:inline-block;" id="filter-popover-wrap">
         <button class="filter-toolbar-btn${hasActiveFilters()?' active':''}" onclick="toggleFilterPopover()">&#9881; Filter${hasActiveFilters()?' ('+activeFilterCount()+')':''}</button>
         <div class="filter-popover" id="filter-popover">
           <div class="filter-popover-row">
             <div class="filter-popover-label">Tenant</div>
-            <select id="fp-tenant" onchange="filterTenantId=this.value;applyFilters()">
+            <select id="fp-tenant" onchange="filterTenantId=this.value;applyFilters(true)">
               <option value="">All Tenants</option>
               ${tenants.map(t=>`<option value="${t.id}" ${filterTenantId===t.id?'selected':''}>${esc(t.name)} · Unit ${esc(t.unit)}</option>`).join('')}
             </select>
           </div>
           <div class="filter-popover-row">
             <div class="filter-popover-label">Month</div>
-            <select id="fp-month" onchange="if(this.value==='__more__'){renderMonthDropdown(true);return;}filterMonth=this.value;applyFilters()">
+            <select id="fp-month" onchange="if(this.value==='__more__'){renderMonthDropdown(true);return;}filterMonth=this.value;applyFilters(true)">
               ${renderMonthOptions()}
             </select>
           </div>
@@ -725,11 +774,9 @@ function renderAdmin() {
         </div>
       </div>
       <div style="position:relative;display:inline-block;" id="sort-popover-wrap">
-        <button class="sort-toolbar-btn" onclick="toggleSortPopover()">&#8645; Sort</button>
+        <button class="sort-toolbar-btn${sortOrder!=='unit-asc'?' active':''}" onclick="toggleSortPopover()">&#8645; Sort${sortOrder!=='unit-asc'?': '+(SORT_LABELS[sortOrder]||''):''}</button>
         <div class="sort-popover" id="sort-popover">
-          <button class="sort-option${sortOrder==='unit-asc'?' active':''}" onclick="setSortOrder('unit-asc')">Unit &#8593;</button>
-          <button class="sort-option${sortOrder==='unit-desc'?' active':''}" onclick="setSortOrder('unit-desc')">Unit &#8595;</button>
-          <button class="sort-option${sortOrder==='name-asc'?' active':''}" onclick="setSortOrder('name-asc')">Name A–Z</button>
+          ${Object.entries(SORT_LABELS).map(([k,lbl])=>`<button class="sort-option${sortOrder===k?' active':''}" onclick="setSortOrder('${k}')">${lbl}</button>`).join('')}
         </div>
       </div>
       ${renderFilterChips()}
@@ -768,12 +815,42 @@ function billRemaining(b) {
 }
 
 // ─────────────────────────────────────────────
+// SAFE BILL WRITES + RE-RENDER
+// ─────────────────────────────────────────────
+// Copy → save to DB → commit to local state only on success, so a failed
+// request never leaves the UI showing unsaved data.
+async function saveBills(tid, mutate, toastMsg) {
+  const t = tenants.find(t=>t.id===tid);
+  if(!t) return false;
+  const billsCopy = structuredClone(t.bills);
+  mutate(billsCopy);
+  try {
+    await dbUpdate(t.id, {bills: billsCopy});
+    t.bills = billsCopy;
+    if(toastMsg) showToast(toastMsg);
+    return true;
+  } catch(e) {
+    showToast('Save failed: '+e.message, false);
+    return false;
+  }
+}
+
+// Re-render the dashboard without losing the admin's scroll position —
+// used after quick actions (mark paid, undo, inline edits) so rows don't
+// jump back to the top of the page.
+function rerenderAdmin() {
+  const y = window.scrollY;
+  renderAdmin();
+  requestAnimationFrame(()=>window.scrollTo(0, y));
+}
+
+// ─────────────────────────────────────────────
 // F-12: UNIFIED DUE STATUS UTILITY
 // ─────────────────────────────────────────────
 function getDueStatus(bill) {
   if(bill.status === 'paid') return 'paid';
-  if(bill.status === 'overdue') return 'overdue';
-  if(!bill.due) return 'no-date';
+  // No due date: honour a legacy manual 'overdue' flag, otherwise unscheduled.
+  if(!bill.due) return bill.status === 'overdue' ? 'overdue' : 'no-date';
   const today = new Date(); today.setHours(0,0,0,0);
   const in3   = new Date(today); in3.setDate(in3.getDate()+3);
   const d     = new Date(bill.due+'T00:00:00');
@@ -784,14 +861,27 @@ function getDueStatus(bill) {
 }
 function getDueUrgencyScore(bill) {
   const s = getDueStatus(bill);
-  if(s==='overdue')   return 0;
+  if(s==='overdue'){
+    // Older overdue sorts first.
+    const today=new Date(); today.setHours(0,0,0,0);
+    const days = bill.due ? Math.floor((today-new Date(bill.due+'T00:00:00'))/86400000) : 0;
+    return -days;
+  }
   if(s==='due-today') return 1;
   if(s==='due-soon')  return 2;
   if(s==='upcoming'){
     const today=new Date(); today.setHours(0,0,0,0);
     return 3+Math.floor((new Date(bill.due+'T00:00:00')-today)/(86400000));
   }
-  return 99;
+  if(s==='no-date') return 900;
+  return 1000; // paid sorts last
+}
+// Days a bill is past due (0 if not overdue / no due date)
+function daysOverdue(bill) {
+  if(bill.status==='paid' || !bill.due) return 0;
+  const today = new Date(); today.setHours(0,0,0,0);
+  const d = new Date(bill.due+'T00:00:00');
+  return d < today ? Math.floor((today-d)/86400000) : 0;
 }
 
 // Maps ordinal unit names/numbers to a sortable integer
@@ -804,6 +894,15 @@ function unitRank(unit) {
   return m ? parseInt(m[1]) : 999;
 }
 
+// Badge colour class from a derived due-status.
+function dsBadgeClass(ds){
+  return { overdue:'ds-overdue', 'due-today':'ds-overdue', 'due-soon':'ds-due',
+           upcoming:'ds-upcoming', 'no-date':'ds-upcoming', paid:'ds-paid' }[ds] || 'ds-upcoming';
+}
+function tenantBalance(t){
+  return t.bills.filter(b=>b.status!=='paid').reduce((s,b)=>s+Math.max(0,billRemaining(b)),0);
+}
+
 function renderRows() {
   const c = document.getElementById('tenant-rows');
   if (!c) return;
@@ -813,11 +912,19 @@ function renderRows() {
   // Apply tenant filter
   let filtered = filterTenantId ? tenants.filter(t=>t.id===filterTenantId) : tenants;
 
+  // Apply search (name / unit / access code)
+  if (filterSearch.trim()) {
+    const q = filterSearch.trim().toLowerCase();
+    filtered = filtered.filter(t =>
+      (t.name||'').toLowerCase().includes(q) ||
+      (t.unit||'').toLowerCase().includes(q) ||
+      (t.code||'').toLowerCase().includes(q));
+  }
+
   // Apply month filter — only show tenants who have at least one bill in that month.
   // NOTE: The {...t, bills} spread creates a shallow copy with a filtered bills array
-  // for DISPLAY ONLY. Functions called from rendered HTML (toggleStatus, etc.) use
-  // tenants.find() on the original array, and t.bills.indexOf(b) resolves the correct
-  // index against the full unfiltered bill list. Do not use these copies for mutations.
+  // for DISPLAY ONLY. The bill objects inside are shared references, so click handlers
+  // must resolve indexes against the ORIGINAL tenant's bill array (see origBillIndex).
   if (filterMonth) {
     // A bill is in-month if its due date matches; bills with no due date are always
     // included so they don't silently disappear from view.
@@ -844,16 +951,26 @@ function renderRows() {
 
   // Result note
   const noteEl = document.getElementById('filter-result-note');
+  const anyFilter = hasActiveFilters() || !!filterSearch.trim();
   if (noteEl) {
-    noteEl.textContent = hasActiveFilters() && !filtered.length ? 'No results match your filters.' : '';
+    noteEl.textContent = anyFilter && !filtered.length ? 'No results match your filters.' : '';
   }
 
-  // Apply sort
+  // Apply sort (stable: ties broken by unit, then name)
   filtered = filtered.slice().sort((a,b)=>{
-    if(sortOrder==='unit-asc')  return unitRank(a.unit)-unitRank(b.unit);
-    if(sortOrder==='unit-desc') return unitRank(b.unit)-unitRank(a.unit);
-    if(sortOrder==='name-asc')  return a.name.localeCompare(b.name);
-    return 0;
+    let r = 0;
+    if(sortOrder==='unit-asc')          r = unitRank(a.unit)-unitRank(b.unit);
+    else if(sortOrder==='unit-desc')    r = unitRank(b.unit)-unitRank(a.unit);
+    else if(sortOrder==='name-asc')     r = a.name.localeCompare(b.name);
+    else if(sortOrder==='balance-desc') r = tenantBalance(b)-tenantBalance(a);
+    else if(sortOrder==='balance-asc')  r = tenantBalance(a)-tenantBalance(b);
+    else if(sortOrder==='urgency') {
+      const urg = t => t.bills.filter(x=>x.status!=='paid').reduce((m,x)=>Math.min(m,getDueUrgencyScore(x)), 10000);
+      r = urg(a)-urg(b);
+    }
+    if(r===0) r = unitRank(a.unit)-unitRank(b.unit);
+    if(r===0) r = a.name.localeCompare(b.name);
+    return r;
   });
 
   if (!filtered.length) {
@@ -863,23 +980,38 @@ function renderRows() {
 
   if (viewMode === 'table') { renderTableView(c, filtered); return; }
 
+  const paidFilterOn = filterStatuses.includes('paid');
+
   c.innerHTML = filtered.map(t=>{
+    // Resolve the original tenant: filtered copies share bill object references,
+    // so indexOf against the original array yields the TRUE index for handlers.
+    const orig = tenants.find(ot=>ot.id===t.id) || t;
+    const origBillIndex = b => orig.bills.indexOf(b);
+
     const activeBills = t.bills.filter(b=>b.status!=='paid');
     const paidBills   = t.bills.filter(b=>b.status==='paid');
     const due = activeBills.reduce((s,b)=>s+Math.max(0,billRemaining(b)),0);
     const total = due?'&#8369;'+due.toLocaleString():`<span style="color:var(--green);font-size:13px;font-family:Inter,sans-serif">Settled</span>`;
-    const actions = `<div class="row-actions"><button class="btn-statement" style="padding:4px 10px;font-size:10px;" onclick="openStmtModalById('${t.id}')" aria-label="Generate statement">Statement</button><button class="btn-icon" onclick="openEditModal('${t.id}')" aria-label="Edit">&#9998;</button><button class="btn-icon del" onclick="deleteTenant('${t.id}')" aria-label="Delete">&#10005;</button></div>`;
+    const actions = `<div class="row-actions"><button class="btn-statement" style="padding:4px 10px;font-size:10px;" onclick="openStmtModalById('${t.id}')" aria-label="Generate statement">Statement</button><button class="btn-icon" onclick="openQuickBill('${t.id}')" title="Add bill" aria-label="Add bill">&#65291;</button><button class="btn-icon" onclick="openEditModal('${t.id}')" title="Edit tenant" aria-label="Edit">&#9998;</button><button class="btn-icon del" onclick="deleteTenant('${t.id}')" title="Archive tenant" aria-label="Archive">&#10005;</button></div>`;
 
-    // Active bill badges sorted by urgency (F-12: uses getDueStatus)
+    // Active bill badges sorted by urgency, coloured by derived due-status
     const sortedActive = activeBills.slice().sort((a,b)=>getDueUrgencyScore(a)-getDueUrgencyScore(b));
     const activeBadges = sortedActive.length
-      ? sortedActive.map(b=>{ const bi=t.bills.indexOf(b); const hasRemark=b.remark&&b.remark.trim(); return `<button class="mini-status status-${b.status}" onclick="toggleStatus('${t.id}',${bi})"${hasRemark?' title="'+esc(b.remark)+'"':''}>${esc(b.label)}${hasRemark?' <span style="opacity:0.5;font-size:9px;">✎</span>':''}</button>`; }).join('')
-      : `<span style="font-size:12px;color:var(--green);font-weight:500">Settled</span>`;
+      ? sortedActive.map(b=>{
+          const bi=origBillIndex(b);
+          const ds=getDueStatus(b);
+          const rem=Math.max(0,billRemaining(b));
+          const tip=`&#8369;${Number(b.amount).toLocaleString()}${b.due?' · due '+formatDate(b.due):''}${b.remark?' · '+esc(b.remark):''} — click to mark paid`;
+          return `<button class="mini-status ${dsBadgeClass(ds)}" onclick="toggleStatus('${t.id}',${bi})" title="${tip}">${esc(b.label)} &#8369;${rem.toLocaleString()}</button>`;
+        }).join('')
+      : (orig.bills.some(b=>b.status!=='paid')
+          ? `<span style="font-size:11px;color:var(--muted);">No unpaid bills match filters</span>`
+          : `<span style="font-size:12px;color:var(--green);font-weight:500">Settled</span>`);
 
     // Paid archive rows — sorted newest first, limited to 3
     const paidSorted = paidBills.slice().sort((a,b)=>(b.paidDate||'').localeCompare(a.paidDate||''));
     const PAID_LIMIT = 3;
-    const buildPaidRows = (bills) => bills.map(b=>{ const bi=t.bills.indexOf(b); return `
+    const buildPaidRows = (bills) => bills.map(b=>{ const bi=origBillIndex(b); return `
       <div class="admin-paid-item">
         <span class="admin-paid-label">${esc(b.label)}</span>
         <span class="admin-paid-amount">&#8369;${Number(b.amount).toLocaleString()}</span>
@@ -888,12 +1020,15 @@ function renderRows() {
       </div>`;}).join('');
     const hiddenPaid = paidSorted.length - PAID_LIMIT;
     const paidListId = 'paid-list-'+t.id;
+    // Open when the admin expanded it earlier, or when the Paid filter is on
+    // (filtering to paid bills and then hiding them would be baffling).
+    const paidOpen = paidFilterOn || _openPaid.has(t.id);
     const paidSection = paidBills.length ? `
       <div class="admin-paid-section">
-        <button class="admin-paid-toggle" onclick="(function(btn){var list=btn.nextElementSibling;list.classList.toggle('open');btn.querySelector('.admin-paid-arrow').classList.toggle('open');}).call(this,this)">
-          <span class="admin-paid-arrow">›</span>&nbsp; Paid (${paidBills.length})
+        <button class="admin-paid-toggle" onclick="togglePaidSection('${t.id}',this)">
+          <span class="admin-paid-arrow${paidOpen?' open':''}">›</span>&nbsp; Paid (${paidBills.length})
         </button>
-        <div class="admin-paid-list" id="${paidListId}">
+        <div class="admin-paid-list${paidOpen?' open':''}" id="${paidListId}">
           ${buildPaidRows(paidSorted.slice(0,PAID_LIMIT))}
           ${hiddenPaid>0?`<button class="admin-paid-show-more" onclick="expandAdminPaid('${t.id}')">Show all (${hiddenPaid} more)</button>`:''}
         </div>
@@ -932,8 +1067,18 @@ function renderRows() {
   }).join('');
 }
 
+// Toggle a tenant's paid-bills section and remember the choice across re-renders.
+function togglePaidSection(tid, btn){
+  const list = btn.nextElementSibling;
+  const arrow = btn.querySelector('.admin-paid-arrow');
+  const nowOpen = !list.classList.contains('open');
+  list.classList.toggle('open', nowOpen);
+  if(arrow) arrow.classList.toggle('open', nowOpen);
+  if(nowOpen) _openPaid.add(tid); else _openPaid.delete(tid);
+}
+
 // ── TABLE DATABASE VIEW ──
-function setViewMode(mode) { viewMode = mode; tableRowLimit = 50; renderAdmin(); }
+function setViewMode(mode) { viewMode = mode; tableRowLimit = 50; rerenderAdmin(); }
 function loadMoreTableRows() { tableRowLimit += 50; renderRows(); }
 
 function sortTable(col) {
@@ -955,21 +1100,31 @@ function renderTableView(c, filtered) {
     });
   });
 
-  // Sort by selected column
+  // Sort by selected column. Rows with no date always sort last, in either
+  // direction, so "sort by paid date" doesn't bury real data under blanks.
   const dir = tableSortDir === 'asc' ? 1 : -1;
+  const cmpDate = (av, bv) => {
+    if (!av && !bv) return 0;
+    if (!av) return 1;
+    if (!bv) return -1;
+    return av.localeCompare(bv) * dir;
+  };
   rows.sort((a, b) => {
-    let av, bv;
+    let r = 0;
     switch (tableSortCol) {
-      case 'status':    av = getDueUrgencyScore(a.bill); bv = getDueUrgencyScore(b.bill); return (av - bv) * dir;
-      case 'tenant':    return a.tenant.name.localeCompare(b.tenant.name) * dir;
-      case 'unit':      return (unitRank(a.tenant.unit) - unitRank(b.tenant.unit)) * dir;
-      case 'label':     return (a.bill.label || '').localeCompare(b.bill.label || '') * dir;
-      case 'amount':    return ((a.bill.amount || 0) - (b.bill.amount || 0)) * dir;
-      case 'remaining': return (billRemaining(a.bill) - billRemaining(b.bill)) * dir;
-      case 'due':       return ((a.bill.due || '9999-99-99').localeCompare(b.bill.due || '9999-99-99')) * dir;
-      case 'paidDate':  return ((a.bill.paidDate || '9999-99-99').localeCompare(b.bill.paidDate || '9999-99-99')) * dir;
-      default: return 0;
+      case 'status':    r = (getDueUrgencyScore(a.bill) - getDueUrgencyScore(b.bill)) * dir; break;
+      case 'tenant':    r = a.tenant.name.localeCompare(b.tenant.name) * dir; break;
+      case 'unit':      r = (unitRank(a.tenant.unit) - unitRank(b.tenant.unit)) * dir; break;
+      case 'label':     r = (a.bill.label || '').localeCompare(b.bill.label || '') * dir; break;
+      case 'amount':    r = ((Number(a.bill.amount) || 0) - (Number(b.bill.amount) || 0)) * dir; break;
+      case 'remaining': r = (billRemaining(a.bill) - billRemaining(b.bill)) * dir; break;
+      case 'due':       r = cmpDate(a.bill.due, b.bill.due); break;
+      case 'paidDate':  r = cmpDate(a.bill.paidDate, b.bill.paidDate); break;
     }
+    // Stable tie-breakers: unit, then due date.
+    if (r === 0) r = unitRank(a.tenant.unit) - unitRank(b.tenant.unit);
+    if (r === 0) r = cmpDate(a.bill.due, b.bill.due);
+    return r;
   });
 
   if (!rows.length) {
@@ -982,8 +1137,7 @@ function renderTableView(c, filtered) {
     return '<th onclick="sortTable(\''+col+'\')">'+label+'<span class="sort-arrow">'+arrow+'</span></th>';
   }
 
-  const dueStatusLabel = { overdue:'Overdue', 'due-today':'Due Today', 'due-soon':'Due Soon', upcoming:'Upcoming', paid:'Paid' };
-  const dueStatusClass = { overdue:'status-unpaid', 'due-today':'status-overdue', 'due-soon':'status-overdue', upcoming:'status-unpaid', paid:'status-paid' };
+  const dueStatusLabel = { overdue:'Overdue', 'due-today':'Due Today', 'due-soon':'Due Soon', upcoming:'Upcoming', 'no-date':'Unscheduled', paid:'Paid' };
 
   const totalRows = rows.length;
   const capped = rows.slice(0, tableRowLimit);
@@ -994,10 +1148,10 @@ function renderTableView(c, filtered) {
     const remaining = Math.max(0, billRemaining(b));
     const isPaid = b.status === 'paid';
     const tidAttr = esc(t.id);
-    // Status badge cycles status on click (matches card-view behavior).
-    const statusBtn = '<button class="mini-status '+(dueStatusClass[ds]||'status-unpaid')+'" '
+    // Status badge toggles paid/unpaid on click (matches card-view behavior).
+    const statusBtn = '<button class="mini-status '+dsBadgeClass(ds)+'" '
       + 'onclick="toggleStatus(\''+tidAttr+'\','+r.bi+')" '
-      + 'title="Click to cycle status" '
+      + 'title="'+(isPaid?'Click to revert to unpaid':'Click to mark paid')+'" '
       + 'style="cursor:pointer;font-size:9px;border:none;">'
       + (dueStatusLabel[ds]||ds)
       + '</button>';
@@ -1125,23 +1279,17 @@ async function commitAmountEdit(input){
 // Pending paid-date action
 let _pendingPaid = null;
 
+// Click on a bill badge: unpaid → confirm-paid modal; paid → back to unpaid.
+// (The old three-way unpaid → overdue → paid cycle was removed — overdue is
+// now derived from the due date, so there is nothing to cycle through.)
 async function toggleStatus(tid,bi){
   const t=tenants.find(t=>t.id===tid);
   if(!t||!t.bills[bi]) return;
-  const cy=['unpaid','overdue','paid'];
-  const next=cy[(cy.indexOf(t.bills[bi].status)+1)%cy.length];
-  if(next==='paid'){
-    // Open date picker modal
-    _pendingPaid={tid,bi};
-    document.getElementById('paiddate-bill-name').textContent = t.bills[bi].label + ' — ' + t.name;
-    document.getElementById('paiddate-input').value=new Date().toISOString().slice(0,10);
-    openModal('paiddate-modal');
-  } else {
-    t.bills[bi].status=next;
-    t.bills[bi].paidDate='';
-    try { await dbUpdate(t.id,{bills:t.bills}); tenants=tenants.map(x=>x.id===t.id?t:x); renderAdmin(); }
-    catch(e) { showToast('Save failed: '+e.message,false); }
-  }
+  if(t.bills[bi].status==='paid'){ revertToPending(tid,bi); return; }
+  _pendingPaid={tid,bi};
+  document.getElementById('paiddate-bill-name').textContent = t.bills[bi].label + ' — ' + t.name;
+  document.getElementById('paiddate-input').value=new Date().toISOString().slice(0,10);
+  openModal('paiddate-modal');
 }
 
 function closePaidModal(){
@@ -1152,23 +1300,23 @@ function closePaidModal(){
 async function confirmPaid(){
   if(!_pendingPaid) return;
   const {tid,bi}=_pendingPaid;
-  const t=tenants.find(t=>t.id===tid);
-  if(!t||!t.bills[bi]){closePaidModal();return;}
-  const dateVal=document.getElementById('paiddate-input').value;
-  t.bills[bi].status='paid';
-  t.bills[bi].paidDate=dateVal||new Date().toISOString().slice(0,10);
   closePaidModal();
-  try { await dbUpdate(t.id,{bills:t.bills}); tenants=tenants.map(x=>x.id===t.id?t:x); renderAdmin(); showToast('Marked as paid ✓'); }
-  catch(e) { showToast('Save failed: '+e.message,false); }
+  const dateVal=document.getElementById('paiddate-input').value;
+  const ok = await saveBills(tid, bills=>{
+    if(!bills[bi]) return;
+    bills[bi].status='paid';
+    bills[bi].paidDate=dateVal||new Date().toISOString().slice(0,10);
+  }, 'Marked as paid ✓');
+  if(ok) rerenderAdmin();
 }
 
 async function revertToPending(tid,bi){
-  const t=tenants.find(t=>t.id===tid);
-  if(!t||!t.bills[bi]) return;
-  t.bills[bi].status='unpaid';
-  t.bills[bi].paidDate='';
-  try { await dbUpdate(t.id,{bills:t.bills}); tenants=tenants.map(x=>x.id===t.id?t:x); renderAdmin(); showToast('Bill moved back to unpaid.'); }
-  catch(e) { showToast('Save failed: '+e.message,false); }
+  const ok = await saveBills(tid, bills=>{
+    if(!bills[bi]) return;
+    bills[bi].status='unpaid';
+    bills[bi].paidDate='';
+  }, 'Bill moved back to unpaid.');
+  if(ok) rerenderAdmin();
 }
 async function deleteTenant(tid){
   if(!confirm('Archive this tenant? Their data will be preserved and can be restored.')) return;
@@ -1176,7 +1324,7 @@ async function deleteTenant(tid){
   try {
     await dbUpdate(tid, {archived_at: new Date().toISOString()});
     tenants = tenants.filter(t=>t.id!==tid);
-    setLoading(false); showToast('Tenant archived.'); renderAdmin();
+    setLoading(false); showToast('Tenant archived.'); rerenderAdmin();
   } catch(e){ setLoading(false); showToast('Archive failed: '+e.message, false); }
 }
 async function restoreTenant(tid){
@@ -1184,7 +1332,7 @@ async function restoreTenant(tid){
   try {
     await dbUpdate(tid, {archived_at: null});
     tenants = await dbGetAll() || [];
-    setLoading(false); showToast('Tenant restored.'); renderAdmin(); loadArchivedTenants();
+    setLoading(false); showToast('Tenant restored.'); rerenderAdmin(); loadArchivedTenants();
   } catch(e){ setLoading(false); showToast('Restore failed: '+e.message, false); }
 }
 async function permanentlyDeleteTenant(tid){
@@ -1236,6 +1384,7 @@ function openAddModal(){
   editingId=null;
   document.getElementById('modal-eyebrow').textContent='New Tenant';
   document.getElementById('modal-title').textContent='Add a tenant';
+  const saveBtn=document.getElementById('btn-save-tenant'); if(saveBtn) saveBtn.textContent='Add tenant';
   document.getElementById('m-name').value='';
   document.getElementById('m-unit').value='';
   document.getElementById('m-code').value=randCode();
@@ -1253,7 +1402,8 @@ function openAddModal(){
 function openEditModal(tid){
   const t=tenants.find(t=>t.id===tid); if(!t) return; editingId=tid;
   document.getElementById('modal-eyebrow').textContent='Edit Tenant';
-  document.getElementById('modal-title').textContent=esc(t.name);
+  document.getElementById('modal-title').textContent=t.name; // textContent — no HTML-escaping needed
+  const saveBtn=document.getElementById('btn-save-tenant'); if(saveBtn) saveBtn.textContent='Save changes';
   document.getElementById('m-name').value=t.name;
   document.getElementById('m-unit').value=t.unit;
   document.getElementById('m-code').value=t.code;
@@ -1360,8 +1510,7 @@ function editBillInline(i){
       <div class="field"><label>Due Date</label><input type="date" id="bi-due-${i}" value="${b.due||''}"></div>
       <div class="field"><label>Status</label>
         <select id="bi-status-${i}" onchange="document.getElementById('bi-pd-wrap-${i}').style.display=this.value==='paid'?'block':'none'">
-          <option value="unpaid" ${b.status==='unpaid'?'selected':''}>Unpaid</option>
-          <option value="overdue" ${b.status==='overdue'?'selected':''}>Overdue</option>
+          <option value="unpaid" ${b.status!=='paid'?'selected':''}>Unpaid</option>
           <option value="paid" ${b.status==='paid'?'selected':''}>Paid</option>
         </select>
       </div>
@@ -1378,26 +1527,31 @@ function editBillInline(i){
 
 async function saveBillEdit(i){
   const t=tenants.find(t=>t.id===editingId); if(!t||!t.bills[i]) return;
+  const label=document.getElementById('bi-label-'+i).value.trim();
+  if(!label){ showToast('Please enter a bill description.', false); return; }
   const _amt = normalizeAmount(document.getElementById('bi-amount-'+i).value);
   const _raw = Number(String(document.getElementById('bi-amount-'+i).value).replace(/,/g,''));
   if(_raw < 0){ showToast('Amount cannot be negative.', false); return; }
   if(_amt===0 && !confirm('Amount is ₱0. Save anyway?')) return;
-  const newStatus=document.getElementById('bi-status-'+i).value;
+  const newStatus=document.getElementById('bi-status-'+i).value==='paid'?'paid':'unpaid';
   const pdInput=document.getElementById('bi-paidDate-'+i);
   const paidDate=newStatus==='paid'?(pdInput?pdInput.value||new Date().toISOString().slice(0,10):new Date().toISOString().slice(0,10)):'';
   let remark=document.getElementById('bi-remark-'+i).value.trim();
   // Auto-clear "pending amount" remark when a real amount is entered
   if(_amt > 0 && remark.toLowerCase().includes('pending amount')) remark = '';
-  t.bills[i]={...t.bills[i],label:document.getElementById('bi-label-'+i).value.trim(),amount:normalizeAmount(document.getElementById('bi-amount-'+i).value),due:document.getElementById('bi-due-'+i).value,status:newStatus,remark,scanLink:(function(v){return /^https:\/\//i.test(v)?v:'';})(document.getElementById('bi-scanLink-'+i).value.trim()),paidDate};
-  try{ await dbUpdate(t.id,{bills:t.bills}); tenants=tenants.map(x=>x.id===t.id?t:x); showToast('Bill updated.'); renderBillListItems(); renderAdmin(); }
-  catch(e){ showToast('Save failed: '+e.message,false); }
+  const due=document.getElementById('bi-due-'+i).value;
+  const scanLink=(function(v){return /^https:\/\//i.test(v)?v:'';})(document.getElementById('bi-scanLink-'+i).value.trim());
+  const ok = await saveBills(editingId, bills=>{
+    if(!bills[i]) return;
+    bills[i]={...bills[i],label,amount:_amt,due,status:newStatus,remark,scanLink,paidDate};
+  }, 'Bill updated.');
+  if(ok){ renderBillListItems(); rerenderAdmin(); }
 }
 
 async function deleteBillFromList(i){
   if(!confirm('Delete this bill? This cannot be undone.')) return;
-  const t=tenants.find(t=>t.id===editingId); if(!t) return; t.bills.splice(i,1);
-  try{ await dbUpdate(t.id,{bills:t.bills}); tenants=tenants.map(x=>x.id===t.id?t:x); showToast('Bill deleted.'); renderBillListItems(); renderAdmin(); }
-  catch(e){ showToast('Delete failed: '+e.message,false); }
+  const ok = await saveBills(editingId, bills=>{ bills.splice(i,1); }, 'Bill deleted.');
+  if(ok){ renderBillListItems(); rerenderAdmin(); }
 }
 
 function startNewBill(){
@@ -1411,7 +1565,6 @@ function startNewBill(){
       <div class="field"><label>Status</label>
         <select id="nb-status" onchange="document.getElementById('nb-pd-wrap').style.display=this.value==='paid'?'block':'none'">
           <option value="unpaid" selected>Unpaid</option>
-          <option value="overdue">Overdue</option>
           <option value="paid">Paid</option>
         </select>
       </div>
@@ -1439,12 +1592,11 @@ async function saveNewBill(){
   if(_rawNb < 0){ showToast('Amount cannot be negative.', false); return; }
   const _nbAmt = normalizeAmount(document.getElementById('nb-amount').value);
   if(_nbAmt===0 && !confirm('Amount is ₱0. Add this bill anyway?')) return;
-  const status=document.getElementById('nb-status').value;
+  const status=document.getElementById('nb-status').value==='paid'?'paid':'unpaid';
   const paidDate=status==='paid'?(document.getElementById('nb-paidDate').value||new Date().toISOString().slice(0,10)):'';
   const bill={label,amount:normalizeAmount(document.getElementById('nb-amount').value),due:document.getElementById('nb-due').value,status,remark:document.getElementById('nb-remark').value.trim(),scanLink:(function(v){return /^https:\/\//i.test(v)?v:'';})(document.getElementById('nb-scanLink').value.trim()),paidDate,payments:[]};
-  const t=tenants.find(t=>t.id===editingId); if(!t){showToast('Tenant not found.',false);return;} t.bills.push(bill);
-  try{ await dbUpdate(t.id,{bills:t.bills}); tenants=tenants.map(x=>x.id===t.id?t:x); showToast('Bill added.'); cancelNewBill(); renderBillListItems(); renderAdmin(); }
-  catch(e){ showToast('Save failed: '+e.message,false); }
+  const ok = await saveBills(editingId, bills=>{ bills.push(bill); }, 'Bill added.');
+  if(ok){ cancelNewBill(); renderBillListItems(); rerenderAdmin(); }
 }
 function addBillForm(){ billForms.push({label:'',amount:'',due:'',status:'unpaid'}); renderBillForms(); }
 function removeBill(i){ billForms.splice(i,1); renderBillForms(); }
@@ -1456,9 +1608,8 @@ function renderBillForms(){
       <div class="field"><label>Due Date</label><input type="date" value="${b.due||''}" onchange="billForms[${i}].due=this.value"></div>
       <div class="field"><label>Status</label>
         <select id="bf-status-${i}" onchange="billForms[${i}].status=this.value;document.getElementById('bf-pd-${i}').style.display=this.value==='paid'?'block':'none'">
-          <option value="unpaid"  ${b.status==='unpaid' ?'selected':''}>Unpaid</option>
-          <option value="overdue" ${b.status==='overdue'?'selected':''}>Overdue</option>
-          <option value="paid"    ${b.status==='paid'   ?'selected':''}>Paid</option>
+          <option value="unpaid"  ${b.status!=='paid'?'selected':''}>Unpaid</option>
+          <option value="paid"    ${b.status==='paid'?'selected':''}>Paid</option>
         </select>
       </div>
       <div class="field bill-remark-field" id="bf-pd-${i}" style="display:${b.status==='paid'?'block':'none'}">
@@ -1486,7 +1637,16 @@ async function saveTenant(){
     const existing = tenants.find(t=>t.id===savingId);
     bills = existing ? existing.bills : [];
   } else {
-    bills = billForms.filter(b=>b.label).map(b=>({...b, amount:normalizeAmount(b.amount), payments:b.payments||[]}));
+    bills = billForms.filter(b=>b.label).map(b=>({
+      label:    b.label.trim(),
+      amount:   normalizeAmount(b.amount),
+      due:      b.due||'',
+      status:   b.status==='paid'?'paid':'unpaid',
+      remark:   (b.remark||'').trim(),
+      scanLink: /^https:\/\//i.test((b.scanLink||'').trim()) ? (b.scanLink||'').trim() : '',
+      paidDate: b.status==='paid' ? (b.paidDate || new Date().toISOString().slice(0,10)) : '',
+      payments: []
+    }));
     const negative = billForms.find(b=>b.label && Number(String(b.amount||'').replace(/,/g,'')) < 0);
     if(negative){ showToast('Amount for "' + negative.label + '" cannot be negative.', false); return; }
     const dropped = billForms.filter(b=>!b.label && (b.amount || b.due));
@@ -1511,7 +1671,7 @@ async function saveTenant(){
       closeModal();
       showToast('Tenant added.');
     }
-    renderAdmin();
+    rerenderAdmin();
   } catch(e){
     setLoading(false);
     showToast('Error: '+e.message, false);
@@ -1519,6 +1679,96 @@ async function saveTenant(){
   }
 }
 function generateCode(){ document.getElementById('m-code').value=randCode(); }
+
+// ─────────────────────────────────────────────
+// QUICK ADD BILL
+// One-screen flow: pick tenant, describe, amount, due — done. Reachable from
+// the toolbar and from every tenant row, so adding a bill never requires
+// opening the edit modal and hunting through tabs.
+// ─────────────────────────────────────────────
+function openQuickBill(tid){
+  if(!tenants.length){ showToast('Add a tenant first.', false); return; }
+  const sel = document.getElementById('qb-tenant');
+  const sorted = tenants.slice().sort((a,b)=>unitRank(a.unit)-unitRank(b.unit));
+  sel.innerHTML = sorted.map(t=>`<option value="${esc(t.id)}"${tid===t.id?' selected':''}>${esc(t.name)} · Unit ${esc(t.unit)}</option>`).join('');
+  // Label suggestions: template labels first, then distinct recent bill labels.
+  const seen = new Set(); const sugg = [];
+  const addSugg = s => { const k=(s||'').trim(); if(k && !seen.has(k.toLowerCase())){ seen.add(k.toLowerCase()); sugg.push(k); } };
+  tenants.forEach(t=>(t.templates||[]).forEach(x=>addSugg(x.label)));
+  tenants.forEach(t=>(t.bills||[]).slice().reverse().forEach(b=>addSugg(b.label)));
+  document.getElementById('qb-label-suggestions').innerHTML = sugg.slice(0,12).map(s=>`<option value="${esc(s)}">`).join('');
+  // Reset fields
+  document.getElementById('qb-label').value='';
+  document.getElementById('qb-amount').value='';
+  document.getElementById('qb-due').value='';
+  document.getElementById('qb-remark').value='';
+  document.getElementById('qb-scan').value='';
+  document.getElementById('qb-paid').checked=false;
+  document.getElementById('qb-paiddate-wrap').style.display='none';
+  document.getElementById('qb-paiddate').value='';
+  const more = document.getElementById('qb-more'); if(more) more.open = false;
+  openModal('addbill-modal');
+}
+function closeQuickBill(){ closeModalEl('addbill-modal'); }
+function qbTogglePaid(cb){
+  document.getElementById('qb-paiddate-wrap').style.display = cb.checked ? 'block' : 'none';
+  if(cb.checked && !document.getElementById('qb-paiddate').value){
+    document.getElementById('qb-paiddate').value = new Date().toISOString().slice(0,10);
+  }
+}
+// When the label matches one of this tenant's templates, prefill amount and due date.
+function qbAutofill(){
+  const label = document.getElementById('qb-label').value.trim().toLowerCase();
+  if(!label) return;
+  const t = tenants.find(t=>t.id===document.getElementById('qb-tenant').value);
+  const tmpl = ((t&&t.templates)||[]).find(x=>(x.label||'').trim().toLowerCase()===label);
+  if(!tmpl) return;
+  const amtEl = document.getElementById('qb-amount');
+  if(!amtEl.value && !tmpl.pendingAmount && Number(tmpl.amount)>0) amtEl.value = tmpl.amount;
+  const dueEl = document.getElementById('qb-due');
+  if(!dueEl.value && tmpl.dayOfMonth){
+    const now = new Date();
+    const day = Math.min(Number(tmpl.dayOfMonth), new Date(now.getFullYear(), now.getMonth()+1, 0).getDate());
+    dueEl.value = now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(day).padStart(2,'0');
+  }
+}
+async function saveQuickBill(addAnother){
+  const tid   = document.getElementById('qb-tenant').value;
+  const label = document.getElementById('qb-label').value.trim();
+  const t = tenants.find(t=>t.id===tid);
+  if(!t){ showToast('Please choose a tenant.', false); return; }
+  if(!label){ showToast('Please enter a bill description.', false); return; }
+  const rawAmt = Number(String(document.getElementById('qb-amount').value).replace(/,/g,''));
+  if(rawAmt < 0){ showToast('Amount cannot be negative.', false); return; }
+  const amount = normalizeAmount(document.getElementById('qb-amount').value);
+  if(amount===0 && !confirm('Amount is ₱0. Add this bill anyway?')) return;
+  const due = document.getElementById('qb-due').value;
+  // Duplicate guard: same label already billed to this tenant in the same month.
+  if(due){
+    const dup = t.bills.some(b=>(b.label||'').trim().toLowerCase()===label.toLowerCase() && b.due && b.due.slice(0,7)===due.slice(0,7));
+    if(dup && !confirm(t.name+' already has a "'+label+'" bill due '+new Date(due.slice(0,7)+'-02').toLocaleString('default',{month:'long',year:'numeric'})+'. Add another?')) return;
+  }
+  const isPaid = document.getElementById('qb-paid').checked;
+  const paidDate = isPaid ? (document.getElementById('qb-paiddate').value || new Date().toISOString().slice(0,10)) : '';
+  const scan = document.getElementById('qb-scan').value.trim();
+  const bill = { label, amount, due, status: isPaid?'paid':'unpaid',
+    remark: document.getElementById('qb-remark').value.trim(),
+    scanLink: /^https:\/\//i.test(scan)?scan:'', paidDate, payments: [] };
+  const ok = await saveBills(tid, bills=>{ bills.push(bill); }, 'Bill added for '+t.name+'.');
+  if(!ok) return;
+  rerenderAdmin();
+  if(addAnother){
+    document.getElementById('qb-label').value='';
+    document.getElementById('qb-amount').value='';
+    document.getElementById('qb-remark').value='';
+    document.getElementById('qb-scan').value='';
+    document.getElementById('qb-paid').checked=false;
+    document.getElementById('qb-paiddate-wrap').style.display='none';
+    document.getElementById('qb-label').focus();
+  } else {
+    closeQuickBill();
+  }
+}
 
 
 // ─────────────────────────────────────────────
@@ -1750,6 +2000,7 @@ document.addEventListener('DOMContentLoaded',()=>{
   _wire('payinst-modal', closePayInstModal);
   _wire('stmt-modal',    closeStmtModal);
   _wire('genbills-modal', closeGenModal);
+  _wire('addbill-modal', closeQuickBill);
 
   // Detect Supabase password recovery redirect
   checkPasswordRecovery();
@@ -1933,7 +2184,7 @@ async function deleteTemplate(i) {
     tenants = tenants.map(x=>x.id===t.id?t:x);
     showToast('Template deleted.');
     renderTemplateList();
-    renderAdmin();
+    rerenderAdmin();
   } catch(e){ templateSaveErr(e); }
 }
 
@@ -1979,7 +2230,7 @@ async function saveNewTemplate() {
     showToast('Template added.');
     cancelNewTemplate();
     renderTemplateList();
-    renderAdmin();
+    rerenderAdmin();
   } catch(e){ templateSaveErr(e); }
 }
 
@@ -2080,7 +2331,7 @@ async function confirmGenerateBills() {
     setLoading(false);
     closeGenModal();
     showToast('Bills generated ✓');
-    renderAdmin();
+    rerenderAdmin();
   } catch(e){ setLoading(false); showToast('Error: '+e.message, false); }
 }
 
@@ -2173,32 +2424,43 @@ function toggleSortPopover() {
 function setSortOrder(order) {
   sortOrder = order;
   document.getElementById('sort-popover').classList.remove('open');
-  renderAdmin();
+  rerenderAdmin();
 }
 function toggleFilterStatus(s) {
   const idx = filterStatuses.indexOf(s);
   if (idx >= 0) filterStatuses.splice(idx, 1);
   else filterStatuses.push(s);
-  applyFilters();
+  applyFilters(true); // keep popover open — toggling several statuses in a row is common
 }
 function removeFilterStatus(s) {
   filterStatuses = filterStatuses.filter(x => x !== s);
   applyFilters();
 }
-function applyFilters() {
+// keepPopover: pass true when the change came from inside the filter popover,
+// so the re-render doesn't slam it shut between clicks.
+function applyFilters(keepPopover) {
   tableRowLimit = 50;
-  renderAdmin();
+  rerenderAdmin();
+  if (keepPopover) {
+    const fp = document.getElementById('filter-popover');
+    if (fp) fp.classList.add('open');
+  }
 }
 function clearFilters() {
   filterTenantId = '';
   filterMonth    = '';
   filterStatuses = [];
+  filterSearch   = '';
   _showAllMonths = false;
   tableRowLimit  = 50;
-  renderAdmin();
+  applyFilters(true);
 }
 // Close popovers when clicking outside
 document.addEventListener('click', function(e) {
+  // A click on a control inside the popover can synchronously re-render the
+  // dashboard, detaching the clicked element before this handler runs. Such a
+  // click was inside the popover — never treat it as "outside".
+  if (e.target && !e.target.isConnected) return;
   const fpWrap = document.getElementById('filter-popover-wrap');
   const spWrap = document.getElementById('sort-popover-wrap');
   if (fpWrap && !fpWrap.contains(e.target)) {
@@ -2232,7 +2494,7 @@ async function savePayInst() {
     paymentInstructions = val;
     closePayInstModal();
     showToast('Payment instructions saved.');
-    renderAdmin();
+    rerenderAdmin();
   } catch(e) {
     errEl.textContent = 'Save failed. Make sure the settings table exists in Supabase.';
     errEl.style.display = 'block';
@@ -2306,6 +2568,7 @@ document.addEventListener('keydown', function(e) {
   if(_el('genbills-modal')) { closeGenModal();     return; }
   if(_el('payinst-modal'))  { closePayInstModal(); return; }
   if(_el('stmt-modal'))     { closeStmtModal();    return; }
+  if(_el('addbill-modal'))  { closeQuickBill();    return; }
   if(_el('tenant-modal'))   { closeModal();        return; }
 });
 
