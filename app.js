@@ -59,7 +59,7 @@ function stmtDefaultPrefs() {
   return {
     preset:'3m', filter:'all',
     colDue:true, colStatus:true, colPaid:true, colPaidDate:true, colRemarks:false,
-    payments:false, group:false, summary:true, sign:false, note:'',
+    payments:false, group:'none', breakdown:true, summary:true, sign:false, note:'',
     sort:'oldest', size:'normal', theme:'color', paper:'a4', orient:'portrait'
   };
 }
@@ -79,6 +79,8 @@ function openStmtModal(tenantObj) {
     const saved = JSON.parse(localStorage.getItem(STMT_PREFS_KEY));
     if(saved && typeof saved==='object') prefs = Object.assign(prefs, saved);
   } catch {}
+  // Migrate: 'group' was a group-by-month boolean before it became a select.
+  if(typeof prefs.group === 'boolean') prefs.group = prefs.group ? 'month' : 'none';
   const setChk = (id,v)=>{ document.getElementById(id).checked = !!v; };
   const setVal = (id,v)=>{ document.getElementById(id).value = v; };
   setVal('stmt-filter', prefs.filter);
@@ -88,7 +90,8 @@ function openStmtModal(tenantObj) {
   setChk('stmt-col-paiddate', prefs.colPaidDate);
   setChk('stmt-col-remarks', prefs.colRemarks);
   setChk('stmt-payments', prefs.payments);
-  setChk('stmt-group', prefs.group);
+  setVal('stmt-group', prefs.group);
+  setChk('stmt-breakdown', prefs.breakdown);
   setChk('stmt-summary', prefs.summary);
   setChk('stmt-sign', prefs.sign);
   setVal('stmt-note', prefs.note||'');
@@ -158,7 +161,8 @@ function getStmtOpts() {
     colDue: chk('stmt-col-due'), colStatus: chk('stmt-col-status'),
     colPaid: chk('stmt-col-paid'), colPaidDate: chk('stmt-col-paiddate'),
     colRemarks: chk('stmt-col-remarks'),
-    payments: chk('stmt-payments'), group: chk('stmt-group'),
+    payments: chk('stmt-payments'), group: val('stmt-group'),
+    breakdown: chk('stmt-breakdown'),
     summary: chk('stmt-summary'), sign: chk('stmt-sign'),
     note: val('stmt-note'),
     sort: val('stmt-sort'), size: val('stmt-size'), theme: val('stmt-theme'),
@@ -251,18 +255,23 @@ function buildStatementHTML(t, o) {
   };
 
   let bodyHtml = '';
-  if(o.group && bills.length) {
+  if(o.group!=='none' && bills.length) {
+    const byCat = o.group==='category';
     const labelSpan = 1 + (o.colDue?1:0);
     const tailSpan  = (o.colStatus?1:0)+(o.colPaidDate?1:0)+(o.colRemarks?1:0);
-    const keys = []; const groups = {};
+    const keyOf = b => byCat ? billCategory(b) : ((b.due||b.paidDate||'').slice(0,7) || 'none');
+    let keys = []; const groups = {};
     bills.forEach(b=>{
-      const k = (b.due||b.paidDate||'').slice(0,7) || 'none';
+      const k = keyOf(b);
       if(!groups[k]){ groups[k]=[]; keys.push(k); }
       groups[k].push(b);
     });
+    // Category groups always print rent first, then utilities, then other.
+    if(byCat) keys = BILL_CATEGORIES.map(c=>c.key).filter(k=>groups[k]);
+    const catLabels = {}; BILL_CATEGORIES.forEach(c=>catLabels[c.key]=c.label);
     bodyHtml = keys.map(k=>{
       const g = groups[k];
-      const name = k==='none' ? 'No due date' : fmtM(k);
+      const name = byCat ? catLabels[k] : (k==='none' ? 'No due date' : fmtM(k));
       const gBilled = g.reduce((s,b)=>s+Number(b.amount||0),0);
       const gPaid   = g.reduce((s,b)=>s+paidOf(b),0);
       const gBal    = g.reduce((s,b)=>s+balOf(b),0);
@@ -281,9 +290,17 @@ function buildStatementHTML(t, o) {
     : '<div class="empty">No bills match the selected period and filters.</div>';
 
   const showAllTimeLine = balTotal !== outstandingAllTime;
+  // Per-category share of the outstanding balance, rent first and emphasized.
+  const catBal = { rent:0, utilities:0, other:0 };
+  bills.forEach(b=>{ catBal[billCategory(b)] += balOf(b); });
+  const catRows = (o.breakdown && balTotal)
+    ? BILL_CATEGORIES.filter(c=>catBal[c.key]>0 || c.key==='rent').map(c=>
+        '<tr class="catrow'+(c.key==='rent'?' rent':'')+'"><td>'+c.label+' outstanding</td><td class="num">'+peso(catBal[c.key])+'</td></tr>').join('')
+    : '';
   const summaryHtml = o.summary ? '<div class="summary"><table class="sumtable">'+
       '<tr><td>Total billed ('+bills.length+' bill'+(bills.length!==1?'s':'')+')</td><td class="num">'+peso(billedTotal)+'</td></tr>'+
       '<tr><td>Total paid</td><td class="num">'+peso(paidTotal)+'</td></tr>'+
+      catRows+
       '<tr class="bal"><td>Balance outstanding'+(o.preset!=='all'?' (this period)':'')+'</td><td class="num">'+peso(balTotal)+'</td></tr>'+
       (showAllTimeLine ? '<tr class="allnote"><td>Total outstanding, all time</td><td class="num">'+peso(outstandingAllTime)+'</td></tr>' : '')+
       '</table></div>' : '';
@@ -348,6 +365,8 @@ function buildStatementHTML(t, o) {
     '.sumtable{width:auto;min-width:46%}'+
     '.sumtable td{border-bottom:1px solid #e8e8ed;padding:'+sz.pad+'}'+
     '.sumtable td:first-child{color:'+muted+';padding-right:28px}'+
+    '.sumtable .catrow td{font-size:0.95em}'+
+    '.sumtable .catrow.rent td{color:#111;font-weight:600}'+
     '.sumtable .bal td{font-weight:700;color:#111;border-bottom:2px solid '+headings+'}'+
     '.sumtable .allnote td{font-size:0.9em;color:'+muted+';border-bottom:none}'+
     '.notes{margin-top:22px;padding:12px 16px;background:'+(bw?'#f7f7f7':'#f8f9fc')+';border-left:3px solid '+accent+';page-break-inside:avoid}'+
@@ -390,9 +409,10 @@ function renderStmtPreview() {
 
   // Footer hint mirrors the numbers on the statement.
   const bills = stmtSelectBills(_stmtTenant, o);
-  const bal = bills.filter(b=>b.status!=='paid').reduce((s,b)=>s+Math.max(0,billRemaining(b)),0);
+  const cat = outstandingByCategory(bills);
   const hint = document.getElementById('stmt-hint');
-  if(hint) hint.innerHTML = bills.length+' bill'+(bills.length!==1?'s':'')+' on statement'+(bal?' &middot; &#8369;'+bal.toLocaleString()+' outstanding':'');
+  if(hint) hint.innerHTML = bills.length+' bill'+(bills.length!==1?'s':'')+' on statement'+
+    (cat.total ? ' &middot; &#8369;'+cat.total.toLocaleString()+' outstanding'+(cat.rent?' (&#8369;'+cat.rent.toLocaleString()+' rent)':'') : '');
 
   fitStmtPreview();
   // Re-fit once content (and web fonts) settle so the page height is right.
@@ -1009,13 +1029,14 @@ function renderAdmin() {
   const billedThisMonth = _billedInMonth(curYM);
   const collectedThisMonth = _collectedInMonth(curYM);
   const rate = billedThisMonth>0 ? Math.round(collectedThisMonth/billedThisMonth*100) : null;
+  const catDue = outstandingByCategory(tenants.flatMap(t=>t.bills));
   const hasTemplates = tenants.some(t=>(t.templates||[]).length>0);
   document.getElementById('main-content').innerHTML=`
     <div class="page-eyebrow">Dashboard</div>
     <div class="page-title">Tenant Overview</div>
     <div class="summary-strip">
       <div class="summary-stat"><div class="stat-label">Tenants</div><div class="stat-value">${tenants.length}</div><div class="stat-sub">${unpaidCount} unpaid bill${unpaidCount!==1?'s':''}</div></div>
-      <div class="summary-stat"><div class="stat-label">Outstanding</div><div class="stat-value blue">&#8369;${totalDue.toLocaleString()}</div><div class="stat-sub">all unpaid bills</div></div>
+      <div class="summary-stat"><div class="stat-label">Outstanding</div><div class="stat-value blue">&#8369;${totalDue.toLocaleString()}</div>${totalDue?`<div class="stat-lines">${balanceLinesHtml(catDue,'stat-line')}</div>`:`<div class="stat-sub">all unpaid bills</div>`}</div>
       <div class="summary-stat"><div class="stat-label">Overdue</div><div class="stat-value ${overdueDue>0?'rust':'green'}">${overdueDue>0?'&#8369;'+overdueDue.toLocaleString():'None'}</div><div class="stat-sub">${overdueCount>0?overdueCount+' bill'+(overdueCount!==1?'s':'')+' past due':'nothing past due'}</div></div>
       <div class="summary-stat"><div class="stat-label">Collected &middot; ${monthLabel}</div><div class="stat-value green">&#8369;${collectedThisMonth.toLocaleString()}</div><div class="stat-sub">of &#8369;${billedThisMonth.toLocaleString()} billed</div></div>
       <div class="summary-stat"><div class="stat-label">Collection Rate</div><div class="stat-value">${rate===null?'&mdash;':rate+'%'}</div><div class="stat-sub">collected vs billed &middot; ${monthLabel}</div></div>
@@ -1120,6 +1141,60 @@ function billTotalPaid(b) {
 }
 function billRemaining(b) {
   return Number(b.amount) - billTotalPaid(b);
+}
+
+// ─────────────────────────────────────────────
+// BILL CATEGORIES — rent vs utilities vs other
+// ─────────────────────────────────────────────
+// Categories are inferred from the bill label so existing data just works.
+const BILL_CATEGORIES = [
+  { key:'rent',      label:'Monthly Rent'  },
+  { key:'utilities', label:'Utilities'     },
+  { key:'other',     label:'Other Charges' }
+];
+
+function billCategory(b) {
+  const l = (b.label||'').toLowerCase();
+  if(/rent/.test(l)) return 'rent';
+  if(/electric|kuryente|power|beneco|meralco|water|tubig|internet|wi-?fi|gas\b|cable|utilit/.test(l)) return 'utilities';
+  return 'other';
+}
+
+// Unpaid remainder per category (mirrors the Math.max(0, billRemaining) rule
+// used everywhere outstanding balances are summed).
+function outstandingByCategory(bills) {
+  const out = { rent:0, utilities:0, other:0, total:0 };
+  (bills||[]).forEach(b=>{
+    if(b.status==='paid') return;
+    const rem = Math.max(0, billRemaining(b));
+    if(!rem) return;
+    out[billCategory(b)] += rem;
+    out.total += rem;
+  });
+  return out;
+}
+
+// Compact inline breakdown ("Rent ₱8,000 · Utilities ₱930"), rent emphasized.
+// Returns '' when nothing is owed.
+function balanceBreakdownHtml(cat) {
+  if(!cat.total) return '';
+  const parts = [];
+  if(cat.rent)      parts.push('<span class="bb-rent">Rent &#8369;'+cat.rent.toLocaleString()+'</span>');
+  if(cat.utilities) parts.push('<span>Utilities &#8369;'+cat.utilities.toLocaleString()+'</span>');
+  if(cat.other)     parts.push('<span>Other &#8369;'+cat.other.toLocaleString()+'</span>');
+  return '<div class="bal-break">'+parts.join('<span class="bb-sep">&middot;</span>')+'</div>';
+}
+
+// Stacked line items for the dashboard / portal stat cards. Rent is always
+// listed when something is owed (a ₱0 rent line is a useful signal);
+// utilities/other only when non-zero.
+function balanceLinesHtml(cat, cls) {
+  if(!cat.total) return '';
+  const line = (label, v, extra) =>
+    '<div class="'+cls+(extra?' '+extra:'')+'"><span>'+label+'</span><span>&#8369;'+v.toLocaleString()+'</span></div>';
+  return line('Monthly Rent', cat.rent, 'rent')+
+    (cat.utilities ? line('Utilities', cat.utilities) : '')+
+    (cat.other ? line('Other Charges', cat.other) : '');
 }
 
 // ─────────────────────────────────────────────
@@ -1319,6 +1394,7 @@ function renderRows() {
       : (trulySettled
           ? `<span style="color:var(--green);font-size:13px;font-family:Inter,sans-serif">Settled</span>`
           : `<span style="color:var(--muted);font-size:13px;font-family:Inter,sans-serif" title="This tenant has unpaid bills hidden by the current filters">&mdash;</span>`);
+    const totalBreak = due ? balanceBreakdownHtml(outstandingByCategory(activeBills)) : '';
     const hasBalance = orig.bills.some(b=>b.status!=='paid' && billRemaining(b)>0);
     const actions = `<div class="row-actions"><button class="btn-statement" style="padding:4px 10px;font-size:10px;" onclick="openStmtModalById('${t.id}')" aria-label="Generate statement">Statement</button>${hasBalance?`<button class="btn-icon" onclick="copyReminder('${t.id}')" title="Copy payment reminder" aria-label="Copy payment reminder">&#9993;</button>`:''}<button class="btn-icon" onclick="openQuickBill('${t.id}')" title="Add bill" aria-label="Add bill">&#65291;</button><button class="btn-icon" onclick="openEditModal('${t.id}')" title="Edit tenant" aria-label="Edit">&#9998;</button><button class="btn-icon del" onclick="deleteTenant('${t.id}')" title="Archive tenant" aria-label="Archive">&#10005;</button></div>`;
 
@@ -1375,7 +1451,7 @@ function renderRows() {
           ${actions}
         </div>
         <div class="tenant-row-bills">${activeBadges}</div>
-        <div class="tenant-row-footer"><div class="row-total-label">Balance Due</div><div class="row-total" style="text-align:right;">${total}</div></div>
+        <div class="tenant-row-footer"><div class="row-total-label">Balance Due</div><div class="row-total" style="text-align:right;">${total}${totalBreak}</div></div>
         ${paidSection}
       </div>`;
     }
@@ -1388,7 +1464,7 @@ function renderRows() {
         </div>
         <div class="col-center"><span class="row-code">${esc(t.code)}</span></div>
         <div class="row-bills col-center">${activeBadges}</div>
-        <div class="row-total col-center">${total}</div>
+        <div class="row-total col-center">${total}${totalBreak}</div>
         ${actions}
       </div>
       ${paidSection}
@@ -2151,6 +2227,7 @@ function renderTenant(){
   const thisMonthDue   = thisMonthBills.reduce((s,b)=>s+Math.max(0,billRemaining(b)),0);
   const overdueDue     = overdueBills.reduce((s,b)=>s+Math.max(0,billRemaining(b)),0);
   const totalDue       = allActiveBills.reduce((s,b)=>s+Math.max(0,billRemaining(b)),0);
+  const catDue         = outstandingByCategory(allActiveBills);
 
   // Month pill list — derive from all bills with a due date
   const monthSet = new Set();
@@ -2253,6 +2330,7 @@ function renderTenant(){
         <div class="portal-bal-stat">
           <div class="portal-bal-label">Total Outstanding</div>
           <div class="portal-bal-value ${totalDue===0?'clear':''}">${totalDue?'&#8369;'+totalDue.toLocaleString():'Settled'}</div>
+          ${totalDue?`<div class="portal-bal-break">${balanceLinesHtml(catDue,'portal-bal-line')}</div>`:''}
         </div>
       </div>
       <div class="bills-card">

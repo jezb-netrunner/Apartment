@@ -218,6 +218,14 @@ main { flex: 1; padding: 52px 40px; max-width: 1120px; margin: 0 auto; width: 10
 .stat-value.green { color: var(--green); }
 .stat-value.rust  { color: var(--rust); }
 .stat-sub { font-size: 11px; color: var(--muted); margin-top: 4px; font-weight: 400; }
+/* Outstanding balance disaggregated into line items — rent first & emphasized */
+.stat-lines { margin-top: 7px; display: flex; flex-direction: column; gap: 2px; max-width: 200px; }
+.stat-line { display: flex; justify-content: space-between; gap: 12px; font-size: 11px; color: var(--muted); font-weight: 400; }
+.stat-line span:last-child { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.stat-line.rent { color: var(--ink); font-weight: 600; }
+.bal-break { font-family: 'Inter', sans-serif; font-size: 10.5px; font-weight: 400; color: var(--muted); margin-top: 3px; line-height: 1.7; }
+.bal-break .bb-rent { color: var(--ink); font-weight: 600; }
+.bal-break .bb-sep { margin: 0 4px; }
 
 /* TABLE */
 .section-bar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
@@ -871,6 +879,11 @@ main { flex: 1; padding: 52px 40px; max-width: 1120px; margin: 0 auto; width: 10
 }
 .portal-bal-value.overdue { color: var(--rust); }
 .portal-bal-value.clear   { color: var(--green); font-size: 14px; }
+/* Total Outstanding disaggregated into line items — rent emphasized */
+.portal-bal-break { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 3px; }
+.portal-bal-line { display: flex; justify-content: space-between; gap: 10px; font-size: 11.5px; color: var(--muted); }
+.portal-bal-line span:last-child { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.portal-bal-line.rent { color: var(--ink); font-weight: 600; }
 
 /* MONTH PILLS */
 .month-pill-wrap {

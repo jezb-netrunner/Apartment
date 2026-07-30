@@ -175,13 +175,23 @@
         </div>
         <div class="stmt-opt-section">
           <div class="stmt-opt-label">Content</div>
-          <div class="stmt-mini-field">
-            <label for="stmt-filter">Include</label>
-            <select id="stmt-filter" onchange="stmtOptsChanged()">
-              <option value="all">All bills</option>
-              <option value="unpaid">Unpaid bills only</option>
-              <option value="paid">Paid bills only</option>
-            </select>
+          <div class="stmt-mini-grid">
+            <div class="stmt-mini-field">
+              <label for="stmt-filter">Include</label>
+              <select id="stmt-filter" onchange="stmtOptsChanged()">
+                <option value="all">All bills</option>
+                <option value="unpaid">Unpaid bills only</option>
+                <option value="paid">Paid bills only</option>
+              </select>
+            </div>
+            <div class="stmt-mini-field">
+              <label for="stmt-group">Group bills</label>
+              <select id="stmt-group" onchange="stmtOptsChanged()">
+                <option value="none">No grouping</option>
+                <option value="month">By month</option>
+                <option value="category">Rent / Utilities / Other</option>
+              </select>
+            </div>
           </div>
           <div class="stmt-checks">
             <label><input type="checkbox" id="stmt-col-due" onchange="stmtOptsChanged()"> Due date</label>
@@ -190,7 +200,7 @@
             <label><input type="checkbox" id="stmt-col-paiddate" onchange="stmtOptsChanged()"> Paid date</label>
             <label><input type="checkbox" id="stmt-col-remarks" onchange="stmtOptsChanged()"> Remarks</label>
             <label><input type="checkbox" id="stmt-payments" onchange="stmtOptsChanged()"> Payment log</label>
-            <label><input type="checkbox" id="stmt-group" onchange="stmtOptsChanged()"> Group by month</label>
+            <label><input type="checkbox" id="stmt-breakdown" onchange="stmtOptsChanged()"> Balance breakdown</label>
             <label><input type="checkbox" id="stmt-summary" onchange="stmtOptsChanged()"> Summary totals</label>
             <label><input type="checkbox" id="stmt-sign" onchange="stmtOptsChanged()"> Signature lines</label>
           </div>
