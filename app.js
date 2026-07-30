@@ -44,99 +44,406 @@ async function deletePaymentEntry(bi, pi) {
 
 
 // ─────────────────────────────────────────────
-// STATEMENT MODAL
+// STATEMENT MODAL — customizable, with live preview
 // ─────────────────────────────────────────────
-let _stmtTenant = null; // tenant object for statement
+let _stmtTenant = null;        // tenant object for statement
+let _stmtPreset = '3m';        // '3m' | '6m' | 'ytd' | 'all' | 'custom'
+let _stmtPreviewTimer = null;
+let _stmtResizeHandler = null;
+
+const STMT_PREFS_KEY = 'oa_stmt_prefs_v1';
+// CSS pixel dimensions of each paper size at 96dpi (portrait)
+const STMT_PAPER_PX = { a4:[794,1123], letter:[816,1056] };
+
+function stmtDefaultPrefs() {
+  return {
+    preset:'3m', filter:'all',
+    colDue:true, colStatus:true, colPaid:true, colPaidDate:true, colRemarks:false,
+    payments:false, group:false, summary:true, sign:false, note:'',
+    sort:'oldest', size:'normal', theme:'color', paper:'a4', orient:'portrait'
+  };
+}
 
 function openStmtModalById(tid) {
   const t = tenants.find(t=>t.id===tid);
   if(t) openStmtModal(t);
 }
+
 function openStmtModal(tenantObj) {
   _stmtTenant = tenantObj || currentUser;
-  const now = new Date();
-  const curYM = now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0');
-  // Default: last 3 months
-  const from = new Date(now.getFullYear(), now.getMonth()-2, 1);
-  const fromYM = from.getFullYear()+'-'+String(from.getMonth()+1).padStart(2,'0');
-  document.getElementById('stmt-from').value = fromYM;
-  document.getElementById('stmt-to').value   = curYM;
+  if(!_stmtTenant) return;
+
+  // Restore saved layout preferences (date range is always recomputed fresh).
+  let prefs = stmtDefaultPrefs();
+  try {
+    const saved = JSON.parse(localStorage.getItem(STMT_PREFS_KEY));
+    if(saved && typeof saved==='object') prefs = Object.assign(prefs, saved);
+  } catch {}
+  const setChk = (id,v)=>{ document.getElementById(id).checked = !!v; };
+  const setVal = (id,v)=>{ document.getElementById(id).value = v; };
+  setVal('stmt-filter', prefs.filter);
+  setChk('stmt-col-due', prefs.colDue);
+  setChk('stmt-col-status', prefs.colStatus);
+  setChk('stmt-col-paid', prefs.colPaid);
+  setChk('stmt-col-paiddate', prefs.colPaidDate);
+  setChk('stmt-col-remarks', prefs.colRemarks);
+  setChk('stmt-payments', prefs.payments);
+  setChk('stmt-group', prefs.group);
+  setChk('stmt-summary', prefs.summary);
+  setChk('stmt-sign', prefs.sign);
+  setVal('stmt-note', prefs.note||'');
+  setVal('stmt-sort', prefs.sort);
+  setVal('stmt-size', prefs.size);
+  setVal('stmt-theme', prefs.theme);
+  setVal('stmt-paper', prefs.paper);
+  setVal('stmt-orient', prefs.orient);
+
   document.getElementById('stmt-title').textContent = 'Statement — '+_stmtTenant.name;
-  document.getElementById('stmt-sub').textContent = 'Unit '+_stmtTenant.unit+' · Select date range to print or save as PDF.';
+  document.getElementById('stmt-sub').textContent = 'Unit '+_stmtTenant.unit+' · Adjust the options — the preview updates live.';
+
+  // 'custom' can't be restored meaningfully across tenants; fall back to 3 months.
+  setStmtPreset(prefs.preset==='custom' ? '3m' : prefs.preset, true);
   openModal('stmt-modal');
+
+  if(!_stmtResizeHandler) {
+    _stmtResizeHandler = ()=>fitStmtPreview();
+    window.addEventListener('resize', _stmtResizeHandler);
+  }
+  // Render after the modal is laid out so the preview can measure its width.
+  requestAnimationFrame(()=>renderStmtPreview());
 }
 
 function closeStmtModal() {
   closeModalEl('stmt-modal');
   _stmtTenant = null;
+  if(_stmtResizeHandler) {
+    window.removeEventListener('resize', _stmtResizeHandler);
+    _stmtResizeHandler = null;
+  }
 }
 
-function printStatement(fullHistory) {
-  const t = _stmtTenant;
-  if(!t) return;
-  const fromYM = document.getElementById('stmt-from').value;
-  const toYM   = document.getElementById('stmt-to').value;
+function setStmtPreset(preset, skipRender) {
+  _stmtPreset = preset;
+  document.querySelectorAll('#stmt-presets .stmt-preset').forEach(btn=>{
+    btn.classList.toggle('active', btn.dataset.preset===preset);
+  });
+  const fromEl = document.getElementById('stmt-from');
+  const toEl   = document.getElementById('stmt-to');
+  const ym = d => d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0');
+  const now = new Date();
+  const allTime = preset==='all';
+  fromEl.disabled = allTime;
+  toEl.disabled   = allTime;
+  if(!allTime) {
+    const back = preset==='6m' ? 5 : 2;
+    fromEl.value = preset==='ytd' ? now.getFullYear()+'-01' : ym(new Date(now.getFullYear(), now.getMonth()-back, 1));
+    toEl.value = ym(now);
+  }
+  if(!skipRender) stmtOptsChanged();
+}
 
-  let bills = t.bills.slice().sort((a,b)=>(b.due||'').localeCompare(a.due||''));
-  let rangeLabel = 'All time';
-  if(!fullHistory && fromYM && toYM) {
+function stmtRangeEdited() {
+  _stmtPreset = 'custom';
+  document.querySelectorAll('#stmt-presets .stmt-preset').forEach(btn=>btn.classList.remove('active'));
+  stmtOptsChanged();
+}
+
+function getStmtOpts() {
+  const chk = id => document.getElementById(id).checked;
+  const val = id => document.getElementById(id).value;
+  return {
+    preset: _stmtPreset,
+    from: val('stmt-from'), to: val('stmt-to'),
+    filter: val('stmt-filter'),
+    colDue: chk('stmt-col-due'), colStatus: chk('stmt-col-status'),
+    colPaid: chk('stmt-col-paid'), colPaidDate: chk('stmt-col-paiddate'),
+    colRemarks: chk('stmt-col-remarks'),
+    payments: chk('stmt-payments'), group: chk('stmt-group'),
+    summary: chk('stmt-summary'), sign: chk('stmt-sign'),
+    note: val('stmt-note'),
+    sort: val('stmt-sort'), size: val('stmt-size'), theme: val('stmt-theme'),
+    paper: val('stmt-paper'), orient: val('stmt-orient')
+  };
+}
+
+function stmtOptsChanged() {
+  const o = getStmtOpts();
+  try {
+    const {from, to, ...prefs} = o; // range is per-visit, everything else persists
+    localStorage.setItem(STMT_PREFS_KEY, JSON.stringify(prefs));
+  } catch {}
+  clearTimeout(_stmtPreviewTimer);
+  _stmtPreviewTimer = setTimeout(()=>renderStmtPreview(), 120);
+}
+
+// Which bills the current options select, in print order.
+function stmtSelectBills(t, o) {
+  let bills = t.bills.slice();
+  if(o.preset!=='all' && o.from && o.to) {
     bills = bills.filter(b => {
       const ym = (b.due||b.paidDate||'').slice(0,7);
-      return ym >= fromYM && ym <= toYM;
+      return ym >= o.from && ym <= o.to;
     });
-    const fmtM = ym => new Date(ym+'-02').toLocaleString('default',{month:'long',year:'numeric'});
-    rangeLabel = fmtM(fromYM)+' – '+fmtM(toYM);
   }
+  if(o.filter==='unpaid') bills = bills.filter(b=>b.status!=='paid');
+  if(o.filter==='paid')   bills = bills.filter(b=>b.status==='paid');
+  const dir = o.sort==='newest' ? -1 : 1;
+  bills.sort((a,b)=>{
+    const da = a.due||a.paidDate||'', db = b.due||b.paidDate||'';
+    if(!da && !db) return 0;
+    if(!da) return 1;              // undated bills always sink to the bottom
+    if(!db) return -1;
+    return da.localeCompare(db)*dir;
+  });
+  return bills;
+}
 
-  // True outstanding balance is over ALL bills, not just the date-ranged subset.
-  const totalDueAllTime = t.bills.filter(b=>b.status!=='paid').reduce((s,b)=>s+Math.max(0,billRemaining(b)),0);
-  const totalDueInRange = bills.filter(b=>b.status!=='paid').reduce((s,b)=>s+Math.max(0,billRemaining(b)),0);
-  const isRanged = !fullHistory && fromYM && toYM;
-  // Use unified due-status so "Upcoming"/"Due Soon"/"Overdue" appear consistently with the dashboard.
+function buildStatementHTML(t, o) {
+  const bills = stmtSelectBills(t, o);
+  const bw = o.theme==='bw';
+
+  const fmtM = ym => new Date(ym+'-02').toLocaleString('default',{month:'long',year:'numeric'});
+  let rangeLabel = 'All time';
+  if(o.preset!=='all' && o.from && o.to)
+    rangeLabel = o.from===o.to ? fmtM(o.from) : fmtM(o.from)+' – '+fmtM(o.to);
+
+  const peso = v => '&#8369;'+Number(v||0).toLocaleString();
+  // A bill marked paid is settled in full even if partial payments weren't logged.
+  const paidOf = b => b.status==='paid' ? Number(b.amount||0) : billTotalPaid(b);
+  const balOf  = b => b.status==='paid' ? 0 : Math.max(0, billRemaining(b));
+
+  const billedTotal = bills.reduce((s,b)=>s+Number(b.amount||0),0);
+  const paidTotal   = bills.reduce((s,b)=>s+paidOf(b),0);
+  const balTotal    = bills.reduce((s,b)=>s+balOf(b),0);
+  const unpaidCount = bills.filter(b=>b.status!=='paid').length;
+  // True outstanding balance is over ALL bills, not just the selected subset.
+  const outstandingAllTime = t.bills.filter(b=>b.status!=='paid').reduce((s,b)=>s+Math.max(0,billRemaining(b)),0);
+
   const dueStatusLabels = { paid:'Paid', overdue:'Overdue', 'due-today':'Due Today', 'due-soon':'Due Soon', upcoming:'Upcoming', 'no-date':'Unscheduled' };
-  const dueStatusColors = { paid:'#27ae60', overdue:'#c0392b', 'due-today':'#c0392b', 'due-soon':'#e67e22', upcoming:'#666', 'no-date':'#666' };
-  const rows = bills.map(b=>{
+  const dueStatusColors = { paid:'#1e8449', overdue:'#c0392b', 'due-today':'#c0392b', 'due-soon':'#b9770e', upcoming:'#5a6776', 'no-date':'#5a6776' };
+  const statusCell = b => {
     const ds = getDueStatus(b);
-    return '<tr><td>'+esc(b.label)+'</td><td>'+(b.due?formatDate(b.due):'-')+'</td>'+
-      '<td style="text-align:right;">&#8369;'+Number(b.amount).toLocaleString()+'</td>'+
-      '<td style="color:'+(dueStatusColors[ds]||'#666')+'">'+(dueStatusLabels[ds]||ds)+'</td>'+
-      '<td>'+(b.paidDate?formatDate(b.paidDate):'-')+'</td>'+
-      '<td>'+esc(b.remark||'')+'</td></tr>';
-  }).join('');
+    const label = dueStatusLabels[ds]||ds;
+    if(bw) return esc(label);
+    const c = dueStatusColors[ds]||'#5a6776';
+    return '<span class="pill" style="color:'+c+';background:'+c+'14;">'+esc(label)+'</span>';
+  };
 
-  const css = 'body{font-family:Arial,sans-serif;padding:32px;color:#111;max-width:800px;margin:0 auto}h1{font-size:22px;margin-bottom:4px}.sub{color:#666;font-size:13px;margin-bottom:24px}table{width:100%;border-collapse:collapse;font-size:13px}th{background:#f1f5f9;padding:8px 10px;text-align:left;font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:#666}td{padding:8px 10px;border-bottom:1px solid #e8e8ed}.total{text-align:right;margin-top:16px;font-size:16px;font-weight:700}@media print{body{padding:0}}';
-  const html = '<!DOCTYPE html><html><head><title>Statement - '+esc(t.name)+'</title><style>'+css+'</style></head><body>'+
-    '<h1>'+esc(t.name)+'</h1>'+
-    '<div class="sub">Unit '+esc(t.unit)+' &nbsp;&middot;&nbsp; '+rangeLabel+' &nbsp;&middot;&nbsp; Generated '+new Date().toLocaleDateString('en-PH',{month:'long',day:'numeric',year:'numeric'})+'</div>'+
-    '<table><thead><tr><th>Bill</th><th>Due Date</th><th>Amount</th><th>Status</th><th>Paid Date</th><th>Remarks</th></tr></thead><tbody>'+rows+'</tbody></table>'+
-    (isRanged && totalDueInRange !== totalDueAllTime
-      ? '<div class="total">Balance for this period: &#8369;'+totalDueInRange.toLocaleString()+'</div>'+
-        '<div class="total" style="font-size:13px;color:#666;font-weight:500;">Total balance outstanding (all time): &#8369;'+totalDueAllTime.toLocaleString()+'</div>'
-      : '<div class="total">Balance Outstanding: &#8369;'+totalDueAllTime.toLocaleString()+'</div>')+
-    '</body></html>';
+  const cols = [
+    { th:'Bill', td:b=>esc(b.label||''), cls:'c-bill' },
+    o.colDue      && { th:'Due Date', td:b=>b.due?formatDate(b.due):'&mdash;' },
+    { th:'Amount', td:b=>peso(b.amount), cls:'num' },
+    o.colPaid     && { th:'Paid', td:b=>paidOf(b)?peso(paidOf(b)):'&mdash;', cls:'num' },
+    o.colPaid     && { th:'Balance', td:b=>balOf(b)?peso(balOf(b)):(b.status==='paid'?peso(0):'&mdash;'), cls:'num' },
+    o.colStatus   && { th:'Status', td:statusCell },
+    o.colPaidDate && { th:'Paid Date', td:b=>b.paidDate?formatDate(b.paidDate):'&mdash;' },
+    o.colRemarks  && { th:'Remarks', td:b=>esc(b.remark||''), cls:'c-remarks' }
+  ].filter(Boolean);
 
-  try {
-    const win = window.open('','_blank');
-    if(!win) throw new Error('blocked');
-    win.document.write(html);
-    win.document.close();
-    // Use setTimeout as fallback since onload may not fire for document.write
-    setTimeout(() => { try { win.print(); } catch(e){} }, 400);
-  } catch(e) {
-    // Pop-up blocked — use hidden iframe instead
-    let iframe = document.getElementById('print-frame');
-    if(!iframe){
-      iframe = document.createElement('iframe');
-      iframe.id = 'print-frame';
-      iframe.style.cssText = 'position:fixed;left:-9999px;width:1px;height:1px;border:none;';
-      document.body.appendChild(iframe);
+  const rowHtml = b => {
+    let h = '<tr>'+cols.map(c=>'<td class="'+(c.cls||'')+'">'+c.td(b)+'</td>').join('')+'</tr>';
+    if(o.payments && b.payments && b.payments.length) {
+      h += '<tr class="payrow"><td colspan="'+cols.length+'">'+
+        b.payments.map(p=>'&#8627; '+peso(p.amount)+' received'+(p.date?' &middot; '+formatDate(p.date):'')+(p.note?' &middot; '+esc(p.note):'')).join('<br>')+
+        '</td></tr>';
     }
-    const doc = iframe.contentDocument || iframe.contentWindow.document;
-    doc.open(); doc.write(html); doc.close();
-    setTimeout(() => { try { iframe.contentWindow.print(); } catch(e){} }, 400);
-    showToast('Pop-up blocked — printing via fallback method.');
+    return h;
+  };
+
+  let bodyHtml = '';
+  if(o.group && bills.length) {
+    const labelSpan = 1 + (o.colDue?1:0);
+    const tailSpan  = (o.colStatus?1:0)+(o.colPaidDate?1:0)+(o.colRemarks?1:0);
+    const keys = []; const groups = {};
+    bills.forEach(b=>{
+      const k = (b.due||b.paidDate||'').slice(0,7) || 'none';
+      if(!groups[k]){ groups[k]=[]; keys.push(k); }
+      groups[k].push(b);
+    });
+    bodyHtml = keys.map(k=>{
+      const g = groups[k];
+      const name = k==='none' ? 'No due date' : fmtM(k);
+      const gBilled = g.reduce((s,b)=>s+Number(b.amount||0),0);
+      const gPaid   = g.reduce((s,b)=>s+paidOf(b),0);
+      const gBal    = g.reduce((s,b)=>s+balOf(b),0);
+      return '<tr class="grouphead"><td colspan="'+cols.length+'">'+esc(name)+'</td></tr>'+
+        g.map(rowHtml).join('')+
+        '<tr class="subtotal"><td colspan="'+labelSpan+'">Subtotal</td><td class="num">'+peso(gBilled)+'</td>'+
+        (o.colPaid ? '<td class="num">'+peso(gPaid)+'</td><td class="num">'+peso(gBal)+'</td>' : '')+
+        (tailSpan ? '<td colspan="'+tailSpan+'"></td>' : '')+'</tr>';
+    }).join('');
+  } else {
+    bodyHtml = bills.map(rowHtml).join('');
   }
-  closeStmtModal();
+
+  const tableHtml = bills.length
+    ? '<table><thead><tr>'+cols.map(c=>'<th class="'+(c.cls||'')+'">'+c.th+'</th>').join('')+'</tr></thead><tbody>'+bodyHtml+'</tbody></table>'
+    : '<div class="empty">No bills match the selected period and filters.</div>';
+
+  const showAllTimeLine = balTotal !== outstandingAllTime;
+  const summaryHtml = o.summary ? '<div class="summary"><table class="sumtable">'+
+      '<tr><td>Total billed ('+bills.length+' bill'+(bills.length!==1?'s':'')+')</td><td class="num">'+peso(billedTotal)+'</td></tr>'+
+      '<tr><td>Total paid</td><td class="num">'+peso(paidTotal)+'</td></tr>'+
+      '<tr class="bal"><td>Balance outstanding'+(o.preset!=='all'?' (this period)':'')+'</td><td class="num">'+peso(balTotal)+'</td></tr>'+
+      (showAllTimeLine ? '<tr class="allnote"><td>Total outstanding, all time</td><td class="num">'+peso(outstandingAllTime)+'</td></tr>' : '')+
+      '</table></div>' : '';
+
+  const noteHtml = (o.note||'').trim()
+    ? '<div class="notes"><div class="sec-label">Notes</div><div class="notes-body">'+esc(o.note.trim()).replace(/\n/g,'<br>')+'</div></div>'
+    : '';
+
+  const signHtml = o.sign
+    ? '<div class="signs">'+
+        '<div class="sign"><div class="sign-line"></div><div class="sign-label">Prepared by &middot; Date</div></div>'+
+        '<div class="sign"><div class="sign-line"></div><div class="sign-label">Received by &middot; Date</div></div>'+
+      '</div>'
+    : '';
+
+  const genDate = new Date().toLocaleDateString('en-PH',{month:'long',day:'numeric',year:'numeric'});
+  const headBalance = bw
+    ? '<div class="head-bal">'+(outstandingAllTime?peso(outstandingAllTime):'Settled')+'</div>'
+    : '<div class="head-bal" style="color:'+(outstandingAllTime?'#c0392b':'#1e8449')+'">'+(outstandingAllTime?peso(outstandingAllTime):'Settled')+'</div>';
+
+  const sizes = {
+    compact:{ base:'10.5px', pad:'5px 8px',  h1:'19px', bal:'17px' },
+    normal: { base:'12px',   pad:'7px 9px',  h1:'21px', bal:'19px' },
+    large:  { base:'13.5px', pad:'9px 10px', h1:'23px', bal:'21px' }
+  };
+  const sz = sizes[o.size]||sizes.normal;
+  const accent = bw ? '#111111' : '#e67e22';
+  const headings = bw ? '#111111' : '#2c3e50';
+  const theadBg = bw ? '#f2f2f2' : '#f1f5f9';
+  const muted = bw ? '#444444' : '#5a6776';
+  const pageSize = (o.paper==='letter'?'letter':'A4')+' '+(o.orient==='landscape'?'landscape':'portrait');
+
+  const css =
+    '*{margin:0;padding:0;box-sizing:border-box}'+
+    'body{font-family:Inter,Arial,Helvetica,sans-serif;color:#111;font-size:'+sz.base+';line-height:1.5;-webkit-print-color-adjust:exact;print-color-adjust:exact}'+
+    '.doc{padding:44px 48px;max-width:1040px;margin:0 auto}'+
+    '.doc-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;padding-bottom:14px;border-bottom:2.5px solid '+headings+';margin-bottom:18px}'+
+    '.brand{font-family:"Source Serif 4",Georgia,serif;font-size:'+sz.h1+';font-weight:700;color:'+headings+';display:flex;align-items:center;gap:9px}'+
+    '.brand .dot{width:0.55em;height:0.55em;border-radius:50%;background:'+accent+';display:inline-block;flex-shrink:0}'+
+    '.brand-sub{font-size:0.72em;font-weight:400;color:'+muted+';font-family:Inter,Arial,sans-serif;margin-top:3px;letter-spacing:0.02em}'+
+    '.doc-type{text-align:right}'+
+    '.doc-type-title{font-size:0.95em;font-weight:600;letter-spacing:0.14em;text-transform:uppercase;color:'+headings+'}'+
+    '.doc-type-gen{font-size:0.88em;color:'+muted+';margin-top:4px}'+
+    '.doc-meta{display:flex;justify-content:space-between;gap:20px;margin-bottom:20px}'+
+    '.meta-label{font-size:0.78em;font-weight:600;letter-spacing:0.12em;text-transform:uppercase;color:'+muted+';margin-bottom:3px}'+
+    '.meta-main{font-weight:600;color:#111}'+
+    '.meta-sub{font-size:0.92em;color:'+muted+';margin-top:1px}'+
+    '.meta-block.right{text-align:right}'+
+    '.head-bal{font-family:"Source Serif 4",Georgia,serif;font-size:'+sz.bal+';font-weight:700}'+
+    'table{width:100%;border-collapse:collapse}'+
+    'thead{display:table-header-group}'+
+    'th{background:'+theadBg+';padding:'+sz.pad+';text-align:left;font-size:0.82em;letter-spacing:0.08em;text-transform:uppercase;color:'+muted+';border-bottom:1.5px solid #d5d9e0}'+
+    'td{padding:'+sz.pad+';border-bottom:1px solid #e8e8ed;vertical-align:top}'+
+    'tr{page-break-inside:avoid}'+
+    '.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}'+
+    '.c-bill{font-weight:500}'+
+    '.pill{display:inline-block;padding:1px 8px;border-radius:99px;font-size:0.9em;font-weight:600;white-space:nowrap}'+
+    '.payrow td{padding-top:2px;font-size:0.9em;color:'+muted+';border-bottom:1px solid #e8e8ed;padding-left:1.6em}'+
+    '.grouphead td{background:'+(bw?'#fafafa':'#fbf7f2')+';font-family:"Source Serif 4",Georgia,serif;font-weight:600;color:'+headings+';border-bottom:1px solid #d5d9e0;padding-top:0.9em}'+
+    '.subtotal td{font-weight:600;background:'+(bw?'#fafafa':'#fcfcfd')+';border-bottom:2px solid #d5d9e0;color:'+headings+'}'+
+    '.summary{display:flex;justify-content:flex-end;margin-top:16px}'+
+    '.sumtable{width:auto;min-width:46%}'+
+    '.sumtable td{border-bottom:1px solid #e8e8ed;padding:'+sz.pad+'}'+
+    '.sumtable td:first-child{color:'+muted+';padding-right:28px}'+
+    '.sumtable .bal td{font-weight:700;color:#111;border-bottom:2px solid '+headings+'}'+
+    '.sumtable .allnote td{font-size:0.9em;color:'+muted+';border-bottom:none}'+
+    '.notes{margin-top:22px;padding:12px 16px;background:'+(bw?'#f7f7f7':'#f8f9fc')+';border-left:3px solid '+accent+';page-break-inside:avoid}'+
+    '.sec-label{font-size:0.78em;font-weight:600;letter-spacing:0.12em;text-transform:uppercase;color:'+muted+';margin-bottom:4px}'+
+    '.notes-body{white-space:normal}'+
+    '.signs{display:flex;gap:48px;margin-top:44px;page-break-inside:avoid}'+
+    '.sign{flex:1;max-width:260px}'+
+    '.sign-line{border-bottom:1.5px solid #111;height:2.2em}'+
+    '.sign-label{font-size:0.85em;color:'+muted+';margin-top:5px}'+
+    '.empty{padding:36px 0;text-align:center;color:'+muted+'}'+
+    '.doc-foot{margin-top:28px;padding-top:10px;border-top:1px solid #e8e8ed;display:flex;justify-content:space-between;font-size:0.82em;color:'+muted+'}'+
+    '@page{size:'+pageSize+';margin:14mm}'+
+    '@media print{.doc{padding:0;max-width:none}}';
+
+  return '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Statement — '+esc(t.name)+'</title>'+
+    '<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,600;8..60,700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">'+
+    '<style>'+css+'</style></head><body><div class="doc">'+
+    '<div class="doc-head">'+
+      '<div><div class="brand"><span class="dot"></span>Orange Apartment</div><div class="brand-sub">Tenant Billing Portal &middot; Baguio</div></div>'+
+      '<div class="doc-type"><div class="doc-type-title">Statement of Account</div><div class="doc-type-gen">Generated '+genDate+'</div></div>'+
+    '</div>'+
+    '<div class="doc-meta">'+
+      '<div class="meta-block"><div class="meta-label">Billed To</div><div class="meta-main">'+esc(t.name)+'</div><div class="meta-sub">Unit '+esc(t.unit)+'</div></div>'+
+      '<div class="meta-block"><div class="meta-label">Period</div><div class="meta-main">'+rangeLabel+'</div><div class="meta-sub">'+bills.length+' bill'+(bills.length!==1?'s':'')+(unpaidCount?' &middot; '+unpaidCount+' unpaid':'')+'</div></div>'+
+      '<div class="meta-block right"><div class="meta-label">Balance Due</div>'+headBalance+'</div>'+
+    '</div>'+
+    tableHtml + summaryHtml + noteHtml + signHtml +
+    '<div class="doc-foot"><span>Orange Apartment &middot; Statement of Account</span><span>'+esc(t.name)+' &middot; Unit '+esc(t.unit)+'</span></div>'+
+    '</div></body></html>';
+}
+
+function renderStmtPreview() {
+  if(!_stmtTenant) return;
+  const iframe = document.getElementById('stmt-preview');
+  if(!iframe) return;
+  const o = getStmtOpts();
+  const html = buildStatementHTML(_stmtTenant, o);
+  const doc = iframe.contentDocument || iframe.contentWindow.document;
+  doc.open(); doc.write(html); doc.close();
+
+  // Footer hint mirrors the numbers on the statement.
+  const bills = stmtSelectBills(_stmtTenant, o);
+  const bal = bills.filter(b=>b.status!=='paid').reduce((s,b)=>s+Math.max(0,billRemaining(b)),0);
+  const hint = document.getElementById('stmt-hint');
+  if(hint) hint.innerHTML = bills.length+' bill'+(bills.length!==1?'s':'')+' on statement'+(bal?' &middot; &#8369;'+bal.toLocaleString()+' outstanding':'');
+
+  fitStmtPreview();
+  // Re-fit once content (and web fonts) settle so the page height is right.
+  setTimeout(fitStmtPreview, 120);
+}
+
+// Scale the paper-sized iframe down to fit the preview pane.
+function fitStmtPreview() {
+  const frame = document.getElementById('stmt-preview-frame');
+  const scaleDiv = document.getElementById('stmt-preview-scale');
+  const iframe = document.getElementById('stmt-preview');
+  if(!frame || !scaleDiv || !iframe || !frame.clientWidth) return;
+  const o = getStmtOpts();
+  let [w,h] = STMT_PAPER_PX[o.paper] || STMT_PAPER_PX.a4;
+  if(o.orient==='landscape') [w,h] = [h,w];
+  let contentH = h;
+  try {
+    const body = iframe.contentDocument && iframe.contentDocument.body;
+    if(body) contentH = Math.max(h, body.scrollHeight);
+  } catch {}
+  const pad = 28; // preview frame padding
+  const s = Math.min(1, (frame.clientWidth - pad) / w);
+  iframe.style.width = w+'px';
+  iframe.style.height = contentH+'px';
+  scaleDiv.style.width = w+'px';
+  scaleDiv.style.transform = 'scale('+s+')';
+  scaleDiv.style.height = Math.ceil(contentH*s)+'px';
+}
+
+function printStatement() {
+  if(!_stmtTenant) return;
+  renderStmtPreview(); // make sure the printed document matches the options
+  const iframe = document.getElementById('stmt-preview');
+  // Small delay so the freshly written document finishes layout first.
+  setTimeout(()=>{
+    try {
+      iframe.contentWindow.focus();
+      iframe.contentWindow.print();
+    } catch(e) {
+      // Fall back to a pop-up window if iframe printing is blocked.
+      try {
+        const win = window.open('','_blank');
+        if(!win) throw new Error('blocked');
+        win.document.write(buildStatementHTML(_stmtTenant, getStmtOpts()));
+        win.document.close();
+        setTimeout(()=>{ try { win.print(); } catch(err){} }, 400);
+      } catch(err) {
+        showToast('Could not open the print dialog — please allow pop-ups.', false);
+      }
+    }
+  }, 250);
 }
 
 

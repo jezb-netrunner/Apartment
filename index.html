@@ -157,16 +157,103 @@
   <div class="stmt-box">
     <div class="stmt-eyebrow">Statement</div>
     <div class="stmt-title" id="stmt-title">Generate Statement</div>
-    <div class="stmt-sub" id="stmt-sub">Select a date range to print or save as PDF.</div>
-    <div class="stmt-range">
-      <div class="field"><label for="stmt-from">From</label><input type="month" id="stmt-from"></div>
-      <div class="field"><label for="stmt-to">To</label><input type="month" id="stmt-to"></div>
+    <div class="stmt-sub" id="stmt-sub">Adjust the options below &mdash; the preview updates live.</div>
+    <div class="stmt-layout">
+      <div class="stmt-opts">
+        <div class="stmt-opt-section">
+          <div class="stmt-opt-label">Period</div>
+          <div class="stmt-presets" id="stmt-presets">
+            <button type="button" class="stmt-preset" data-preset="3m" onclick="setStmtPreset('3m')">3 months</button>
+            <button type="button" class="stmt-preset" data-preset="6m" onclick="setStmtPreset('6m')">6 months</button>
+            <button type="button" class="stmt-preset" data-preset="ytd" onclick="setStmtPreset('ytd')">This year</button>
+            <button type="button" class="stmt-preset" data-preset="all" onclick="setStmtPreset('all')">All time</button>
+          </div>
+          <div class="stmt-range">
+            <div class="stmt-mini-field"><label for="stmt-from">From</label><input type="month" id="stmt-from" onchange="stmtRangeEdited()"></div>
+            <div class="stmt-mini-field"><label for="stmt-to">To</label><input type="month" id="stmt-to" onchange="stmtRangeEdited()"></div>
+          </div>
+        </div>
+        <div class="stmt-opt-section">
+          <div class="stmt-opt-label">Content</div>
+          <div class="stmt-mini-field">
+            <label for="stmt-filter">Include</label>
+            <select id="stmt-filter" onchange="stmtOptsChanged()">
+              <option value="all">All bills</option>
+              <option value="unpaid">Unpaid bills only</option>
+              <option value="paid">Paid bills only</option>
+            </select>
+          </div>
+          <div class="stmt-checks">
+            <label><input type="checkbox" id="stmt-col-due" onchange="stmtOptsChanged()"> Due date</label>
+            <label><input type="checkbox" id="stmt-col-status" onchange="stmtOptsChanged()"> Status</label>
+            <label><input type="checkbox" id="stmt-col-paid" onchange="stmtOptsChanged()"> Paid &amp; balance</label>
+            <label><input type="checkbox" id="stmt-col-paiddate" onchange="stmtOptsChanged()"> Paid date</label>
+            <label><input type="checkbox" id="stmt-col-remarks" onchange="stmtOptsChanged()"> Remarks</label>
+            <label><input type="checkbox" id="stmt-payments" onchange="stmtOptsChanged()"> Payment log</label>
+            <label><input type="checkbox" id="stmt-group" onchange="stmtOptsChanged()"> Group by month</label>
+            <label><input type="checkbox" id="stmt-summary" onchange="stmtOptsChanged()"> Summary totals</label>
+            <label><input type="checkbox" id="stmt-sign" onchange="stmtOptsChanged()"> Signature lines</label>
+          </div>
+          <div class="stmt-mini-field">
+            <label for="stmt-note">Note on statement <span class="stmt-opt-optional">(optional)</span></label>
+            <textarea id="stmt-note" rows="2" maxlength="400" placeholder="e.g. Please settle within 7 days of receipt." oninput="stmtOptsChanged()"></textarea>
+          </div>
+        </div>
+        <div class="stmt-opt-section">
+          <div class="stmt-opt-label">Appearance</div>
+          <div class="stmt-mini-grid">
+            <div class="stmt-mini-field">
+              <label for="stmt-sort">Order</label>
+              <select id="stmt-sort" onchange="stmtOptsChanged()">
+                <option value="oldest">Oldest first</option>
+                <option value="newest">Newest first</option>
+              </select>
+            </div>
+            <div class="stmt-mini-field">
+              <label for="stmt-size">Text size</label>
+              <select id="stmt-size" onchange="stmtOptsChanged()">
+                <option value="compact">Compact</option>
+                <option value="normal">Normal</option>
+                <option value="large">Large</option>
+              </select>
+            </div>
+            <div class="stmt-mini-field">
+              <label for="stmt-theme">Ink</label>
+              <select id="stmt-theme" onchange="stmtOptsChanged()">
+                <option value="color">Color</option>
+                <option value="bw">Black &amp; white</option>
+              </select>
+            </div>
+            <div class="stmt-mini-field">
+              <label for="stmt-paper">Paper</label>
+              <select id="stmt-paper" onchange="stmtOptsChanged()">
+                <option value="a4">A4</option>
+                <option value="letter">Letter</option>
+              </select>
+            </div>
+            <div class="stmt-mini-field">
+              <label for="stmt-orient">Layout</label>
+              <select id="stmt-orient" onchange="stmtOptsChanged()">
+                <option value="portrait">Portrait</option>
+                <option value="landscape">Landscape</option>
+              </select>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="stmt-preview-col">
+        <div class="stmt-preview-frame" id="stmt-preview-frame">
+          <div class="stmt-preview-scale" id="stmt-preview-scale">
+            <iframe id="stmt-preview" title="Statement preview"></iframe>
+          </div>
+        </div>
+      </div>
     </div>
     <div class="stmt-actions">
-      <button class="btn-cancel" onclick="closeStmtModal()">Cancel</button>
+      <div class="stmt-actions-hint" id="stmt-hint"></div>
+      <button class="btn-cancel" onclick="closeStmtModal()">Close</button>
       <button class="btn-save" onclick="printStatement()">Print / Save PDF</button>
     </div>
-    <button class="btn-stmt-full" onclick="printStatement(true)">Print Full Statement (all time)</button>
   </div>
 </div>
 
