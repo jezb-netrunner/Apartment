@@ -48,6 +48,10 @@
         <label for="tenant-code">Access Code</label>
         <input type="text" id="tenant-code" autocomplete="one-time-code" maxlength="20" placeholder="e.g. XKQR-A7BN" style="letter-spacing:0.1em;text-transform:uppercase" oninput="this.value=this.value.toUpperCase()" onkeydown="if(event.key==='Enter')tenantLogin()">
       </div>
+      <div class="remember-row">
+        <input type="checkbox" id="tenant-remember" checked>
+        <label for="tenant-remember">Keep me signed in on this device</label>
+      </div>
       <button class="btn-primary" onclick="tenantLogin()">View My Bills</button>
     </div>
     <div class="login-error" id="login-error"></div>
@@ -92,6 +96,19 @@
         <div class="field"><label for="m-phone">Phone <span style="font-weight:400;color:var(--muted)">(optional)</span></label><input type="text" id="m-phone" maxlength="30" placeholder="e.g. 0917 123 4567"></div>
         <div class="field"><label for="m-email">Email <span style="font-weight:400;color:var(--muted)">(optional)</span></label><input type="email" id="m-email" maxlength="120" placeholder="e.g. tenant@email.com"></div>
         <div class="field"><label for="m-movein">Move-in Date <span style="font-weight:400;color:var(--muted)">(optional)</span></label><input type="date" id="m-movein"></div>
+        <div class="field"><label for="m-floor">Floor / Group <span style="font-weight:400;color:var(--muted)">(optional)</span></label><input type="text" id="m-floor" maxlength="40" placeholder="e.g. 3rd Floor"></div>
+        <div class="field full">
+          <label for="m-billing">Billing Model</label>
+          <select id="m-billing" onchange="onBillingModelChange()">
+            <option value="itemized">Itemized — rent + utilities billed separately</option>
+            <option value="inclusive">All-inclusive — one flat monthly rate</option>
+          </select>
+        </div>
+        <div class="field full" id="m-flatrate-wrap" style="display:none">
+          <label for="m-flatrate">Monthly Flat Rate (&#8369;)</label>
+          <input type="text" id="m-flatrate" inputmode="decimal" autocomplete="off" placeholder="e.g. 6500">
+          <div class="field-hint">Shown to the tenant as their fixed monthly rate, utilities included. A monthly bill template is created automatically for new tenants.</div>
+        </div>
       </div>
       <div id="new-tenant-bills">
         <hr class="divider">
@@ -334,6 +351,40 @@
     </div>
   </div>
 </div>
+
+<!-- ANNOUNCEMENTS EDIT MODAL -->
+<div id="announce-modal" role="dialog" aria-modal="true" aria-labelledby="announce-modal-title">
+  <div class="payinst-box">
+    <div class="payinst-eyebrow">Announcements</div>
+    <div class="payinst-title" id="announce-modal-title">Edit Announcements</div>
+    <div class="payinst-sub">Shown to every tenant at the top of their portal. Leave empty to hide the notice board.</div>
+    <label for="announce-textarea" style="position:absolute;left:-9999px;">Announcements</label>
+    <textarea id="announce-textarea" placeholder="e.g. Water interruption on Aug 15, 8am&ndash;5pm.&#10;Hallway cleaning every Saturday morning."></textarea>
+    <div id="announce-error" style="display:none;color:var(--rust);font-size:12px;margin-top:8px;font-weight:500;"></div>
+    <div class="payinst-actions">
+      <button class="btn-cancel" onclick="closeAnnounceModal()">Cancel</button>
+      <button class="btn-save" onclick="saveAnnouncements()">Save Announcements</button>
+    </div>
+  </div>
+</div>
+
+<!-- BRANDING / PROPERTY NAME MODAL -->
+<div id="branding-modal" role="dialog" aria-modal="true" aria-labelledby="branding-modal-title">
+  <div class="payinst-box">
+    <div class="payinst-eyebrow">Property</div>
+    <div class="payinst-title" id="branding-modal-title">Property Name</div>
+    <div class="payinst-sub">Used across the portal: the header, the login screen, printed statements, and payment reminders.</div>
+    <div class="field"><label for="branding-name">Property Name</label><input type="text" id="branding-name" maxlength="60" placeholder="e.g. Orange Apartment"></div>
+    <div class="field"><label for="branding-sub">Tagline / Location <span style="font-weight:400;color:var(--muted)">(optional, shown on statements)</span></label><input type="text" id="branding-sub" maxlength="80" placeholder="e.g. Tenant Billing Portal &middot; Baguio"></div>
+    <div id="branding-error" style="display:none;color:var(--rust);font-size:12px;margin-top:8px;font-weight:500;"></div>
+    <div class="payinst-actions">
+      <button class="btn-cancel" onclick="closeBrandingModal()">Cancel</button>
+      <button class="btn-save" onclick="saveBranding()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- EXPENSE PANEL lives inside the dashboard markup rendered by app.js -->
 
 
 <!-- supabase-js v2.45.4 vendored from the official npm package (dist/umd/supabase.js)
