@@ -110,7 +110,7 @@ function openStmtModal(tenantObj) {
   setVal('stmt-orient', prefs.orient);
 
   document.getElementById('stmt-title').textContent = 'Statement — '+_stmtTenant.name;
-  document.getElementById('stmt-sub').textContent = 'Unit '+_stmtTenant.unit+' · Adjust the options — the preview updates live.';
+  document.getElementById('stmt-sub').textContent = 'Unit '+_stmtTenant.unit+((_stmtTenant.floor||'').trim()?' · '+_stmtTenant.floor:'')+' · Adjust the options — the preview updates live.';
 
   // 'custom' can't be restored meaningfully across tenants; fall back to 3 months.
   setStmtPreset(prefs.preset==='custom' ? '3m' : prefs.preset, true);
@@ -401,7 +401,7 @@ function buildStatementHTML(t, o) {
       '<div class="doc-type"><div class="doc-type-title">Statement of Account</div><div class="doc-type-gen">Generated '+genDate+'</div></div>'+
     '</div>'+
     '<div class="doc-meta">'+
-      '<div class="meta-block"><div class="meta-label">Billed To</div><div class="meta-main">'+esc(t.name)+'</div><div class="meta-sub">Unit '+esc(t.unit)+'</div></div>'+
+      '<div class="meta-block"><div class="meta-label">Billed To</div><div class="meta-main">'+esc(t.name)+'</div><div class="meta-sub">Unit '+esc(t.unit)+((t.floor||'').trim()?' &middot; '+esc(t.floor):'')+'</div></div>'+
       '<div class="meta-block"><div class="meta-label">Period</div><div class="meta-main">'+rangeLabel+'</div><div class="meta-sub">'+bills.length+' bill'+(bills.length!==1?'s':'')+(unpaidCount?' &middot; '+unpaidCount+' unpaid':'')+'</div></div>'+
       '<div class="meta-block right"><div class="meta-label">Balance Due</div>'+headBalance+'</div>'+
     '</div>'+
@@ -647,12 +647,6 @@ function applyBranding() {
   if(nav) nav.innerHTML = '<span class="nav-dot"></span>' + esc(propertyName);
 }
 
-async function dbGetSetting(key) {
-  try {
-    const rows = await sbFetch('settings?key=eq.'+encodeURIComponent(key)+'&select=value');
-    return (rows && rows[0]) ? rows[0].value : '';
-  } catch { return ''; }
-}
 async function dbSetSetting(key, value) {
   await sbFetch('settings', {
     method: 'POST',
@@ -678,6 +672,7 @@ let _editingExpenseId = null;
 const PORTAL_CODE_KEY = 'oa_tenant_code';
 let filterTenantId = '';   // '' = all
 let filterMonth    = '';   // '' = all, else 'YYYY-MM'
+let filterFloor    = '';   // '' = all, '__none__' = tenants without a floor, else exact floor label
 let filterStatuses = [];   // [] = show all; else subset of ['overdue','due-soon','due-today','upcoming','paid']
 let filterSearch   = '';   // free-text search on tenant name / unit / code
 let sortOrder      = 'unit-asc'; // key of SORT_LABELS
@@ -691,6 +686,7 @@ let _openPaid = new Set();  // tenant ids whose "Paid" section is expanded
 const SORT_LABELS = {
   'unit-asc':     'Unit &#8593;',
   'unit-desc':    'Unit &#8595;',
+  'floor-asc':    'Floor &#8593;',
   'name-asc':     'Name A&ndash;Z',
   'balance-desc': 'Balance high &rarr; low',
   'balance-asc':  'Balance low &rarr; high',
@@ -945,6 +941,7 @@ async function logout() {
   _editingExpenseId = null;
   filterTenantId = '';
   filterMonth    = '';
+  filterFloor    = '';
   filterStatuses = [];
   filterSearch   = '';
   _openPaid      = new Set();
@@ -967,8 +964,6 @@ async function logout() {
 }
 
 function renderActionRequired() {
-  const today = new Date(); today.setHours(0,0,0,0);
-  const in3 = new Date(today); in3.setDate(in3.getDate()+3);
   const items = [];
   tenants.forEach(t => {
     t.bills.forEach((b,bi) => {
@@ -1533,7 +1528,7 @@ function renderAdmin() {
             <div class="filter-popover-label">Tenant</div>
             <select id="fp-tenant" onchange="filterTenantId=this.value;applyFilters(true)">
               <option value="">All Tenants</option>
-              ${tenants.map(t=>`<option value="${t.id}" ${filterTenantId===t.id?'selected':''}>${esc(t.name)} · Unit ${esc(t.unit)}</option>`).join('')}
+              ${tenants.map(t=>`<option value="${t.id}" ${filterTenantId===t.id?'selected':''}>${esc(t.name)} · Unit ${esc(t.unit)}${(t.floor||'').trim()?' · '+esc(t.floor):''}</option>`).join('')}
             </select>
           </div>
           <div class="filter-popover-row">
@@ -1542,6 +1537,14 @@ function renderAdmin() {
               ${renderMonthOptions()}
             </select>
           </div>
+          ${floorList().length?`<div class="filter-popover-row">
+            <div class="filter-popover-label">Floor</div>
+            <select id="fp-floor" onchange="filterFloor=this.value;applyFilters(true)">
+              <option value="">All Floors</option>
+              ${floorList().map(f=>`<option value="${esc(f)}" ${filterFloor===f?'selected':''}>${esc(f)}</option>`).join('')}
+              ${tenants.some(t=>!(t.floor||'').trim())?`<option value="__none__" ${filterFloor==='__none__'?'selected':''}>(No floor set)</option>`:''}
+            </select>
+          </div>`:''}
           <div class="filter-popover-row">
             <div class="filter-popover-label">Status</div>
             <div class="filter-status-chips" id="fp-status-chips">
@@ -1741,6 +1744,16 @@ function unitRank(unit) {
   const m = s.match(/([0-9]+)/);
   return m ? parseInt(m[1]) : 999;
 }
+// Floor labels rank like units, except ground floor sorts first.
+function floorRank(s) {
+  return /\bground\b|^g\/?f\b/i.test(s) ? 0 : unitRank(s);
+}
+// Distinct floor labels currently in use, in floor order.
+function floorList() {
+  const set = new Set();
+  tenants.forEach(t=>{ const f=(t.floor||'').trim(); if(f) set.add(f); });
+  return Array.from(set).sort((a,b)=>floorRank(a)-floorRank(b) || a.localeCompare(b));
+}
 
 // Badge colour class from a derived due-status.
 function dsBadgeClass(ds){
@@ -1759,6 +1772,12 @@ function renderRows() {
 
   // Apply tenant filter
   let filtered = filterTenantId ? tenants.filter(t=>t.id===filterTenantId) : tenants;
+
+  // Apply floor filter ('__none__' = tenants without a floor label)
+  if (filterFloor) {
+    const want = filterFloor==='__none__' ? '' : filterFloor;
+    filtered = filtered.filter(t => (t.floor||'').trim() === want);
+  }
 
   // Apply search — matches tenants (name / unit / access code) OR bills
   // (label / remark). A tenant match shows the whole tenant; a bill-only
@@ -1823,6 +1842,7 @@ function renderRows() {
     let r = 0;
     if(sortOrder==='unit-asc')          r = unitRank(a.unit)-unitRank(b.unit);
     else if(sortOrder==='unit-desc')    r = unitRank(b.unit)-unitRank(a.unit);
+    else if(sortOrder==='floor-asc')    r = floorRank((a.floor||'').trim()||'zz')-floorRank((b.floor||'').trim()||'zz');
     else if(sortOrder==='name-asc')     r = a.name.localeCompare(b.name);
     else if(sortOrder==='balance-desc') r = tenantBalance(b)-tenantBalance(a);
     else if(sortOrder==='balance-asc')  r = tenantBalance(a)-tenantBalance(b);
@@ -1950,14 +1970,13 @@ function renderRows() {
   // 'auto' preserves the historical default: floor headers when floor labels
   // exist AND the list is unit-sorted (interleaving group headers into a
   // balance-sorted list would be misleading). Explicit modes always group.
-  const _floorRank = s => /\bground\b|^g\/?f\b/i.test(s) ? 0 : unitRank(s);
   let keyOf = null, labelOf = null, rankOf = null;
   if(groupMode==='floor' ||
-     (groupMode==='auto' && (sortOrder==='unit-asc'||sortOrder==='unit-desc')
+     (groupMode==='auto' && (sortOrder==='unit-asc'||sortOrder==='unit-desc'||sortOrder==='floor-asc')
        && filtered.some(t=>(t.floor||'').trim()))) {
     keyOf   = t => (t.floor||'').trim();
     labelOf = k => k ? esc(k) : 'Unassigned';
-    rankOf  = _floorRank;
+    rankOf  = floorRank;
   } else if(groupMode==='unit') {
     keyOf   = t => (t.unit||'').trim();
     labelOf = k => k ? 'Unit '+esc(k) : 'No unit';
@@ -2044,6 +2063,7 @@ function renderTableView(c, filtered) {
       case 'status':    r = (getDueUrgencyScore(a.bill) - getDueUrgencyScore(b.bill)) * dir; break;
       case 'tenant':    r = a.tenant.name.localeCompare(b.tenant.name) * dir; break;
       case 'unit':      r = (unitRank(a.tenant.unit) - unitRank(b.tenant.unit)) * dir; break;
+      case 'floor':     r = (floorRank((a.tenant.floor||'').trim()||'zz') - floorRank((b.tenant.floor||'').trim()||'zz')) * dir; break;
       case 'label':     r = (a.bill.label || '').localeCompare(b.bill.label || '') * dir; break;
       case 'amount':    r = ((Number(a.bill.amount) || 0) - (Number(b.bill.amount) || 0)) * dir; break;
       case 'remaining': {
@@ -2072,6 +2092,9 @@ function renderTableView(c, filtered) {
   }
 
   const dueStatusLabel = { overdue:'Overdue', 'due-today':'Due Today', 'due-soon':'Due Soon', upcoming:'Upcoming', 'no-date':'Unscheduled', paid:'Paid' };
+
+  // Floor column only when the field is in use — no dead column otherwise.
+  const showFloor = tenants.some(t=>(t.floor||'').trim());
 
   const totalRows = rows.length;
   const capped = rows.slice(0, tableRowLimit);
@@ -2107,6 +2130,7 @@ function renderTableView(c, filtered) {
       '<td>'+statusBtn+'</td>' +
       '<td>'+esc(t.name)+'</td>' +
       '<td>'+esc(t.unit)+'</td>' +
+      (showFloor ? '<td>'+esc(t.floor||'')+'</td>' : '') +
       '<td>'+esc(b.label)+'</td>' +
       amountCell +
       '<td class="td-amount">'+(remaining ? '&#8369;'+remaining.toLocaleString() : '<span style="color:var(--green)">—</span>')+'</td>' +
@@ -2127,6 +2151,7 @@ function renderTableView(c, filtered) {
       thHtml('status','Status') +
       thHtml('tenant','Tenant') +
       thHtml('unit','Unit') +
+      (showFloor ? thHtml('floor','Floor') : '') +
       thHtml('label','Bill') +
       thHtml('amount','Amount') +
       thHtml('remaining','Balance') +
@@ -2316,7 +2341,7 @@ async function loadArchivedTenants(){
       <div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--border);">
         <div style="flex:1;">
           <div style="font-size:14px;font-weight:600;color:var(--ink);" data-tid="${t.id}">${esc(t.name)}</div>
-          <div style="font-size:11px;color:var(--muted);">Unit ${esc(t.unit)} &nbsp;·&nbsp; Archived ${formatDate((t.archived_at||'').slice(0,10))}</div>
+          <div style="font-size:11px;color:var(--muted);">Unit ${esc(t.unit)}${(t.floor||'').trim()?' &nbsp;·&nbsp; '+esc(t.floor):''} &nbsp;·&nbsp; Archived ${formatDate((t.archived_at||'').slice(0,10))}</div>
         </div>
         <button class="btn-icon" onclick="restoreTenant('${t.id}')" title="Restore tenant" aria-label="Restore" style="color:var(--green);border-color:var(--green);">&#8635;</button>
         <button class="btn-icon del" onclick="permanentlyDeleteTenant('${t.id}')" title="Permanently delete" aria-label="Delete">&#10005;</button>
@@ -2689,7 +2714,7 @@ function openQuickBill(tid){
   if(!tenants.length){ showToast('Add a tenant first.', false); return; }
   const sel = document.getElementById('qb-tenant');
   const sorted = tenants.slice().sort((a,b)=>unitRank(a.unit)-unitRank(b.unit));
-  sel.innerHTML = sorted.map(t=>`<option value="${esc(t.id)}"${tid===t.id?' selected':''}>${esc(t.name)} · Unit ${esc(t.unit)}</option>`).join('');
+  sel.innerHTML = sorted.map(t=>`<option value="${esc(t.id)}"${tid===t.id?' selected':''}>${esc(t.name)} · Unit ${esc(t.unit)}${(t.floor||'').trim()?' · '+esc(t.floor):''}</option>`).join('');
   // Label suggestions: template labels first, then distinct recent bill labels.
   const seen = new Set(); const sugg = [];
   const addSugg = s => { const k=(s||'').trim(); if(k && !seen.has(k.toLowerCase())){ seen.add(k.toLowerCase()); sugg.push(k); } };
@@ -2952,7 +2977,7 @@ function renderTenant(){
       <div class="page-title">${esc(t.name)}</div>
       <div class="portal-pull">
         <div class="portal-pull-text">"Your bills, clearly laid out."</div>
-        <div class="portal-pull-sub">Unit ${esc(t.unit)}${isInclusive?' &nbsp;·&nbsp; All-inclusive rate':''} &nbsp;·&nbsp; Contact management if anything looks incorrect.</div>
+        <div class="portal-pull-sub">Unit ${esc(t.unit)}${(t.floor||'').trim()?' &nbsp;·&nbsp; '+esc(t.floor):''}${isInclusive?' &nbsp;·&nbsp; All-inclusive rate':''} &nbsp;·&nbsp; Contact management if anything looks incorrect.</div>
       </div>
       ${announcements?`
       <div class="portal-announce">
@@ -3482,7 +3507,7 @@ function refreshGenPreview() {
     if(!(k in groupMap)){ groupMap[k]=[]; groupOrder.push(k); }
     groupMap[k].push(e);
   });
-  groupOrder.sort((a,b)=>{ if(!a) return 1; if(!b) return -1; return unitRank(a)-unitRank(b) || a.localeCompare(b); });
+  groupOrder.sort((a,b)=>{ if(!a) return 1; if(!b) return -1; return floorRank(a)-floorRank(b) || a.localeCompare(b); });
   _genState = {
     yr, mo,
     useGroups: groupOrder.length > 1,
@@ -3706,11 +3731,12 @@ function setFilterThisMonth() {
   filterMonth = (filterMonth === ym) ? '' : ym; // toggle off if already active
   applyFilters();
 }
-function hasActiveFilters() { return !!(filterTenantId || filterMonth || filterStatuses.length); }
+function hasActiveFilters() { return !!(filterTenantId || filterMonth || filterFloor || filterStatuses.length); }
 function activeFilterCount() {
   let n = 0;
   if (filterTenantId) n++;
   if (filterMonth) n++;
+  if (filterFloor) n++;
   if (filterStatuses.length) n += filterStatuses.length;
   return n;
 }
@@ -3724,6 +3750,10 @@ function renderFilterChips() {
   if (filterMonth) {
     const lbl = new Date(filterMonth+'-02').toLocaleString('default',{month:'short',year:'numeric'});
     chips.push('<span class="filter-chip">'+lbl+'<button class="filter-chip-x" aria-label="Remove month filter" onclick="filterMonth=\'\';applyFilters()">&#10005;</button></span>');
+  }
+  if (filterFloor) {
+    const lbl = filterFloor==='__none__' ? 'No floor set' : esc(filterFloor);
+    chips.push('<span class="filter-chip">'+lbl+'<button class="filter-chip-x" aria-label="Remove floor filter" onclick="filterFloor=\'\';applyFilters()">&#10005;</button></span>');
   }
   filterStatuses.forEach(s => {
     chips.push('<span class="filter-chip">'+(statusLabels[s]||s)+'<button class="filter-chip-x" aria-label="Remove status filter" onclick="removeFilterStatus(\''+s+'\')">&#10005;</button></span>');
@@ -3791,6 +3821,7 @@ function applyFilters(keepPopover) {
 function clearFilters() {
   filterTenantId = '';
   filterMonth    = '';
+  filterFloor    = '';
   filterStatuses = [];
   filterSearch   = '';
   _showAllMonths = false;
