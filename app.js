@@ -2990,7 +2990,7 @@ function renderTenant(){
           <div class="portal-rate-label">Your Monthly Rate</div>
           <div class="portal-rate-value">&#8369;${flatRate.toLocaleString()}<span class="portal-rate-per">/month</span></div>
         </div>
-        <div class="portal-rate-sub">All-inclusive &mdash; water &amp; electricity are covered. You'll never receive a separate utility bill.</div>
+        <div class="portal-rate-sub">All-inclusive</div>
       </div>`:''}
       ${isInclusive?`
       <div class="portal-balance-strip inclusive-strip">
