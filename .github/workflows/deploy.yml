@@ -26,6 +26,10 @@ jobs:
       # fresh app.js/app.css after every deploy instead of a stale cached copy.
       - name: Stamp asset version
         run: sed -i "s/__ASSET_V__/${GITHUB_SHA::7}/g" index.html
+      # Server-side files have no business on the public site — the SQL
+      # documents the schema and rate-limit internals.
+      - name: Strip non-site files
+        run: rm -f supabase-migration*.sql
       - uses: actions/upload-pages-artifact@v3
         with:
           path: '.'

@@ -10,7 +10,7 @@ function openAddPayment(bi) {
   formEl.innerHTML = `<div class="payment-add-form">
     <div class="form-grid">
       <div class="field"><label>Amount Received (&#8369;)</label><input type="text" id="pf-amount-${bi}" placeholder="0" inputmode="decimal" pattern="[0-9.]*" autocomplete="off"></div>
-      <div class="field"><label>Date</label><input type="date" id="pf-date-${bi}" value="${new Date().toISOString().slice(0,10)}"></div>
+      <div class="field"><label>Date</label><input type="date" id="pf-date-${bi}" value="${todayISO()}"></div>
       <div class="field full"><label>Note <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted)">(optional)</span></label><input type="text" id="pf-note-${bi}" placeholder="e.g. GCash ref #1234567"></div>
     </div>
     <div style="display:flex;gap:8px;margin-top:10px;">
@@ -26,6 +26,14 @@ async function savePaymentEntry(bi) {
   const note = document.getElementById('pf-note-'+bi).value.trim();
   if(!amt||amt<=0){ showToast('Please enter a valid amount.',false); return; }
   if(!date){ showToast('Please select a date.',false); return; }
+  // Overpayment guard: excess beyond the remaining balance doesn't carry
+  // anywhere, so make the admin confirm it's intentional (typo catcher).
+  const _t = tenants.find(t=>t.id===editingId);
+  const _b = _t && _t.bills[bi];
+  if(_b){
+    const rem = Math.max(0, billRemaining(_b));
+    if(amt > rem && !confirm('This payment (₱'+amt.toLocaleString()+') is more than the remaining balance (₱'+rem.toLocaleString()+') for "'+_b.label+'". Record it anyway?')) return;
+  }
   const ok = await saveBills(editingId, bills=>{
     if(!bills[bi]) return;
     if(!bills[bi].payments) bills[bi].payments = [];
@@ -186,6 +194,10 @@ function stmtSelectBills(t, o) {
   if(o.preset!=='all' && o.from && o.to) {
     bills = bills.filter(b => {
       const ym = (b.due||b.paidDate||'').slice(0,7);
+      // Undated UNPAID bills are open obligations — a period statement that
+      // omits them would understate what the tenant owes. Undated paid bills
+      // are historic noise and stay out of ranged periods.
+      if(!ym) return b.status!=='paid';
       return ym >= o.from && ym <= o.to;
     });
   }
@@ -385,7 +397,7 @@ function buildStatementHTML(t, o) {
     '<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,600;8..60,700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">'+
     '<style>'+css+'</style></head><body><div class="doc">'+
     '<div class="doc-head">'+
-      '<div><div class="brand"><span class="dot"></span>Orange Apartment</div><div class="brand-sub">Tenant Billing Portal &middot; Baguio</div></div>'+
+      '<div><div class="brand"><span class="dot"></span>'+esc(propertyName)+'</div><div class="brand-sub">'+esc(propertySubtitle)+'</div></div>'+
       '<div class="doc-type"><div class="doc-type-title">Statement of Account</div><div class="doc-type-gen">Generated '+genDate+'</div></div>'+
     '</div>'+
     '<div class="doc-meta">'+
@@ -394,7 +406,7 @@ function buildStatementHTML(t, o) {
       '<div class="meta-block right"><div class="meta-label">Balance Due</div>'+headBalance+'</div>'+
     '</div>'+
     tableHtml + summaryHtml + noteHtml + signHtml +
-    '<div class="doc-foot"><span>Orange Apartment &middot; Statement of Account</span><span>'+esc(t.name)+' &middot; Unit '+esc(t.unit)+'</span></div>'+
+    '<div class="doc-foot"><span>'+esc(propertyName)+' &middot; Statement of Account</span><span>'+esc(t.name)+' &middot; Unit '+esc(t.unit)+'</span></div>'+
     '</div></body></html>';
 }
 
@@ -489,13 +501,22 @@ const SB_KEY = 'sb_publishable_FgSrHN3LoB9XQ4ZQHCeoQQ_AXg54YkP';
 const _sbClient = supabase.createClient(SB_URL, SB_KEY, {
   auth: {
     persistSession: false,
-    autoRefreshToken: false,
+    // Keep the admin session alive for the life of the tab. Nothing is
+    // persisted to storage (persistSession stays false); without this the
+    // JWT expired after ~an hour and writes silently fell back to the anon
+    // key — RLS filtered them to zero rows and the UI showed success.
+    autoRefreshToken: true,
     detectSessionInUrl: false
   }
 });
 
+const SESSION_EXPIRED_MSG = 'Your session has expired — please sign out and sign in again.';
+
 async function _getAuthHeaders() {
   const { data: { session } } = await _sbClient.auth.getSession();
+  // An admin with no live session must NEVER fall back to the anon key:
+  // anon writes match zero rows under RLS and would be mistaken for success.
+  if(!session && currentUser === 'admin') throw new Error(SESSION_EXPIRED_MSG);
   const token = session ? session.access_token : SB_KEY;
   return { 'apikey': SB_KEY, 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'Prefer': 'return=representation' };
 }
@@ -504,16 +525,127 @@ async function sbFetch(path, options={}) {
   const headers = await _getAuthHeaders();
   if(options.headers_extra) { Object.assign(headers, options.headers_extra); delete options.headers_extra; }
   const res = await fetch(SB_URL + '/rest/v1/' + path, { headers, ...options });
-  if (!res.ok) { const e = await res.text(); throw new Error(e); }
+  if (!res.ok) {
+    // Surface the PostgREST message text, not the raw JSON body — these
+    // strings end up in user-facing toasts.
+    const body = await res.text();
+    let msg = body;
+    try {
+      const j = JSON.parse(body);
+      msg = j.message || j.error_description || j.msg || j.hint || body;
+    } catch {}
+    if(res.status === 401 && currentUser === 'admin') msg = SESSION_EXPIRED_MSG;
+    if(!msg) msg = 'Request failed (HTTP ' + res.status + '). Please check your connection and try again.';
+    const err = new Error(msg);
+    err.status = res.status;
+    throw err;
+  }
   const txt = await res.text();
   return txt ? JSON.parse(txt) : null;
 }
-async function dbGetAll()       { return await sbFetch('tenants?select=*&order=name&archived_at=is.null'); }
+// Legacy rows (or rows created outside the app) can have null bills/templates;
+// normalize once at load so render code never has to null-check arrays.
+function _normalizeTenant(t) {
+  if(!t) return t;
+  if(!Array.isArray(t.bills)) t.bills = [];
+  if(!Array.isArray(t.templates)) t.templates = [];
+  return t;
+}
+async function dbGetAll()       { const rows = await sbFetch('tenants?select=*&order=name&archived_at=is.null'); (rows||[]).forEach(_normalizeTenant); return rows; }
 async function dbInsert(t)      { return await sbFetch('tenants', { method:'POST', body: JSON.stringify(t) }); }
 async function dbUpdate(id, t)  { return await sbFetch('tenants?id=eq.' + id, { method:'PATCH', body: JSON.stringify(t) }); }
 async function dbDelete(id)     { return await sbFetch('tenants?id=eq.' + id, { method:'DELETE' }); }
 
+// Optimistic-concurrency write for tenant bills/templates (uses the rev
+// column from supabase-migration-2.sql; degrades to a plain PATCH when the
+// column doesn't exist). Two admin tabs PATCHing the whole jsonb array used
+// to silently overwrite each other — last write won and payments vanished.
+// Now a stale write matches zero rows; we reload the fresh row and throw a
+// conflict error so the caller can tell the admin to redo the change.
+async function dbUpdateTenantGuarded(t, patch) {
+  if(t.rev == null) { await dbUpdate(t.id, patch); return; }
+  const nextRev = Number(t.rev) + 1;
+  const rows = await sbFetch('tenants?id=eq.' + t.id + '&rev=eq.' + t.rev,
+    { method:'PATCH', body: JSON.stringify({ ...patch, rev: nextRev }) });
+  if(rows && rows.length) { t.rev = nextRev; return; }
+  try {
+    const fresh = await sbFetch('tenants?id=eq.' + t.id + '&select=*');
+    if(fresh && fresh.length) {
+      _normalizeTenant(fresh[0]);
+      tenants = tenants.map(x => x.id === t.id ? fresh[0] : x);
+    }
+  } catch {}
+  const err = new Error('This tenant was just updated from another tab or device. The latest data has been reloaded — please redo your change.');
+  err.conflict = true;
+  throw err;
+}
+
+// ── EXPENSES (admin-only; table added in supabase-migration-2.sql) ──
+async function dbGetExpenses()      { return await sbFetch('expenses?select=*&order=expense_date.desc,created_at.desc'); }
+async function dbInsertExpense(x)   { return await sbFetch('expenses', { method:'POST', body: JSON.stringify(x) }); }
+async function dbUpdateExpense(id,x){ return await sbFetch('expenses?id=eq.' + encodeURIComponent(id), { method:'PATCH', body: JSON.stringify(x) }); }
+async function dbDeleteExpense(id)  { return await sbFetch('expenses?id=eq.' + encodeURIComponent(id), { method:'DELETE' }); }
+
 let paymentInstructions = ''; // loaded from Supabase settings table
+let announcements       = ''; // notice board shown on every tenant portal
+// Branding defaults match the historical hardcoded strings, so an instance
+// that never runs migration 2 or sets a name looks exactly the same as before.
+let propertyName        = 'Orange Apartment';
+let propertySubtitle    = 'Tenant Billing Portal · Baguio';
+
+// Tenant-visible settings, batched. Falls back to per-key read_setting calls
+// when the read_portal_settings RPC (migration 2) isn't installed yet.
+async function loadPortalSettings() {
+  let s = null;
+  let anyLoaded = false;
+  try { s = await sbFetch('rpc/read_portal_settings', { method:'POST', body:'{}' }); anyLoaded = true; } catch {}
+  if(!s || typeof s !== 'object') {
+    s = {};
+    const keys = ['payment_instructions','announcements','property_name','property_subtitle'];
+    await Promise.all(keys.map(async k => {
+      try { s[k] = await sbFetch('rpc/read_setting', { method:'POST', body: JSON.stringify({ setting_key: k }) }); anyLoaded = true; } catch {}
+    }));
+  }
+  // Total failure (e.g. offline at page load): clear the cached promise so
+  // the next tenant login retries instead of serving the failure all session.
+  if(!anyLoaded) _portalSettingsPromise = null;
+  paymentInstructions = (typeof s.payment_instructions === 'string') ? s.payment_instructions : '';
+  announcements       = (typeof s.announcements === 'string') ? s.announcements : '';
+  if(typeof s.property_name === 'string' && s.property_name.trim()) propertyName = s.property_name.trim();
+  if(typeof s.property_subtitle === 'string' && s.property_subtitle.trim()) propertySubtitle = s.property_subtitle.trim();
+  try { localStorage.setItem('oa_branding', JSON.stringify({ name: propertyName, sub: propertySubtitle })); } catch {}
+  applyBranding();
+}
+
+// Admin-side settings load: one query instead of one per key.
+let _settingsLoadFailed = false;
+async function loadAdminSettings() {
+  _settingsLoadFailed = false;
+  try {
+    const rows = await sbFetch('settings?select=key,value&key=in.(payment_instructions,announcements,property_name,property_subtitle)');
+    const map = {}; (rows||[]).forEach(r=>{ map[r.key]=r.value; });
+    paymentInstructions = map.payment_instructions || '';
+    announcements       = map.announcements || '';
+    if((map.property_name||'').trim()) propertyName = map.property_name.trim();
+    if((map.property_subtitle||'').trim()) propertySubtitle = map.property_subtitle.trim();
+  } catch {
+    // A transient failure must not masquerade as "Not set" — editing on top
+    // of that would overwrite the real values with blanks.
+    _settingsLoadFailed = true;
+    showToast('Could not load portal settings — shown values may be stale. Refresh before editing them.', false);
+  }
+  try { localStorage.setItem('oa_branding', JSON.stringify({ name: propertyName, sub: propertySubtitle })); } catch {}
+  applyBranding();
+}
+
+// Stamp the property name onto the static chrome (tab title, wordmarks).
+function applyBranding() {
+  document.title = propertyName;
+  const login = document.querySelector('.login-wordmark');
+  if(login) login.textContent = propertyName;
+  const nav = document.querySelector('.nav-wordmark');
+  if(nav) nav.innerHTML = '<span class="nav-dot"></span>' + esc(propertyName);
+}
 
 async function dbGetSetting(key) {
   try {
@@ -531,6 +663,19 @@ async function dbSetSetting(key, value) {
 let currentUser = null;
 let tenants = [];
 let editingId = null;
+// Expenses ledger (admin-only). `expensesAvailable` flips false when the
+// expenses table doesn't exist yet (migration 2 not run) so the dashboard
+// can show setup instructions instead of a broken panel.
+let expenses = [];
+let expensesAvailable = true;
+let _expensesLoadError = false; // true = fetch failed for a non-schema reason
+let _expensesOpen = false;
+let expenseMonth = '';      // '' = current month, else 'YYYY-MM'
+let _editingExpenseId = null;
+// localStorage key for the remembered tenant access code. The code is a
+// bearer credential for a READ-ONLY view of the tenant's own bills; storing
+// it on the tenant's device is an accepted trade-off for one-tap access.
+const PORTAL_CODE_KEY = 'oa_tenant_code';
 let filterTenantId = '';   // '' = all
 let filterMonth    = '';   // '' = all, else 'YYYY-MM'
 let filterStatuses = [];   // [] = show all; else subset of ['overdue','due-soon','due-today','upcoming','paid']
@@ -606,7 +751,9 @@ function showToast(msg, ok=true) {
   el.style.opacity = '1';
   el.style.transform = 'translateX(-50%) translateY(0)';
   clearTimeout(el._t);
-  el._t = setTimeout(()=>{ el.style.opacity='0'; el.style.transform='translateX(-50%) translateY(12px)'; }, 2500);
+  // Longer messages (errors, conflict explanations) stay up long enough to read.
+  const hold = Math.min(7000, 2500 + Math.max(0, msg.length - 40) * 35);
+  el._t = setTimeout(()=>{ el.style.opacity='0'; el.style.transform='translateX(-50%) translateY(12px)'; }, hold);
 }
 
 function switchTab(tab) {
@@ -654,7 +801,16 @@ async function tenantLogin() {
   try {
     const rows = await sbFetch('rpc/login_tenant', { method:'POST', body: JSON.stringify({ access_code: code }) });
     setLoading(false);
-    if(rows && rows.length) { _loginAttempts.count = 0; currentUser=rows[0]; tenants=rows; showApp(); }
+    if(rows && rows.length) {
+      _loginAttempts.count = 0;
+      currentUser=_normalizeTenant(rows[0]); tenants=rows;
+      const rememberEl = document.getElementById('tenant-remember');
+      try {
+        if(!rememberEl || rememberEl.checked) localStorage.setItem(PORTAL_CODE_KEY, code);
+        else localStorage.removeItem(PORTAL_CODE_KEY);
+      } catch {}
+      showApp();
+    }
     else {
       // Count only FAILED attempts; lock after the 5th failure. (The server
       // enforces the real rate limit — this just gives fast local feedback.)
@@ -685,8 +841,20 @@ async function showApp() {
     document.getElementById('header-info').textContent='Admin';
     setLoading(true,'Loading tenants…');
     try {
-      tenants = await dbGetAll() || [];
-      paymentInstructions = await dbGetSetting('payment_instructions');
+      const [rows] = await Promise.all([
+        dbGetAll(),
+        loadAdminSettings(),
+        dbGetExpenses().then(x=>{ expenses = x||[]; expensesAvailable = true; _expensesLoadError = false; })
+          .catch(e=>{
+            expenses = [];
+            // "Table missing" means migration 2 hasn't run — show setup help.
+            // Anything else (network, auth) is a load error, NOT missing setup.
+            const missing = /relation .*expenses|expenses.*does not exist|Could not find the table/i.test(e.message||'');
+            expensesAvailable = !missing;
+            _expensesLoadError = !missing;
+          })
+      ]);
+      tenants = rows || [];
     } catch(e) {
       setLoading(false);
       document.getElementById('main-content').innerHTML = '<div style="padding:48px 24px;text-align:center;"><div style="font-size:32px;margin-bottom:16px;">⚠</div><div style="font-family:Inter,sans-serif;font-size:16px;font-weight:600;color:var(--ink);margin-bottom:8px;">Could not connect to database</div><div style="font-size:13px;color:var(--muted);margin-bottom:24px;">'+esc(e.message)+'</div><button class="btn-primary" style="width:auto;padding:10px 24px;" onclick="location.reload()">Retry</button></div>';
@@ -696,20 +864,72 @@ async function showApp() {
     setLoading(false); renderAdmin();
   } else {
     document.getElementById('header-info').textContent=`Unit ${currentUser.unit}`;
-    try {
-      const val = await sbFetch('rpc/read_setting', { method:'POST', body: JSON.stringify({ setting_key: 'payment_instructions' }) });
-      paymentInstructions = (typeof val === 'string') ? val : '';
-    } catch(e) { paymentInstructions = ''; }
+    // Reuse the page-load settings fetch instead of firing a second one.
+    await (_portalSettingsPromise || loadPortalSettings().catch(()=>{}));
     renderTenant();
   }
 }
+
+// Silent login from a ?code=XXXX portal link or a remembered device code.
+// Runs once on page load; any failure falls back to the normal login screen.
+async function tryAutoLogin() {
+  if(window.location.hash) return; // password-recovery flow owns the URL hash
+  let code = '';
+  let fromLink = false;
+  try {
+    const params = new URLSearchParams(window.location.search);
+    code = (params.get('code')||'').trim().toUpperCase();
+  } catch {}
+  if(code) {
+    fromLink = true;
+    // Strip the code from the address bar so it isn't left in plain sight.
+    history.replaceState(null, '', window.location.pathname);
+  } else {
+    try { code = (localStorage.getItem(PORTAL_CODE_KEY)||'').trim().toUpperCase(); } catch {}
+  }
+  if(!code) return;
+  setLoading(true, 'Signing you in…');
+  try {
+    const rows = await sbFetch('rpc/login_tenant', { method:'POST', body: JSON.stringify({ access_code: code }) });
+    if(rows && rows.length) {
+      currentUser = _normalizeTenant(rows[0]); tenants = rows;
+      // Deep-link visits deliberately do NOT persist the code: the link may
+      // have been opened on a shared or borrowed device. Staying signed in
+      // is the remember-me checkbox's job on the manual login form.
+      setLoading(false);
+      showApp();
+      return;
+    }
+    // Code no longer valid (tenant archived / code regenerated): forget it.
+    try { localStorage.removeItem(PORTAL_CODE_KEY); } catch {}
+    switchTab('tenant');
+    document.getElementById('tenant-code').value = code;
+    if(fromLink) document.getElementById('login-error').textContent = 'That link is no longer valid — please check your access code.';
+  } catch(e) {
+    // Offline or rate-limited. The URL code was already stripped from the
+    // address bar, so hand it back via the form — otherwise the tenant is
+    // stranded with no code and no explanation.
+    switchTab('tenant');
+    document.getElementById('tenant-code').value = code;
+    document.getElementById('login-error').textContent = 'Connection problem — tap "View My Bills" to try again.';
+  }
+  setLoading(false);
+}
 async function logout() {
   if(currentUser==='admin') await _sbClient.auth.signOut();
+  else { try { localStorage.removeItem(PORTAL_CODE_KEY); } catch {} }
   // Reset every piece of session state so a subsequent login starts clean.
   currentUser = null;
   tenants = [];
   editingId = null;
   paymentInstructions = '';
+  announcements = '';
+  _portalSettingsPromise = null; // next tenant login refetches fresh settings
+  expenses = [];
+  expensesAvailable = true;
+  _expensesOpen = false;
+  expenseMonth = '';
+  _editingExpenseId = null;
   filterTenantId = '';
   filterMonth    = '';
   filterStatuses = [];
@@ -942,7 +1162,7 @@ function renderInsights() {
     barSvg = '<div class="cg-bars">'
       + tenantBalances.map(x => {
           const pct = (x.balance / barMax * 100).toFixed(1);
-          return '<div class="cg-bar-row" onclick="filterTenantId=\''+esc(x.id)+'\';applyFilters()" title="Filter to '+esc(x.name)+'">'
+          return '<div class="cg-bar-row" role="button" tabindex="0" onkeydown="if(event.key===\'Enter\')this.click()" onclick="filterTenantId=\''+esc(x.id)+'\';applyFilters()" title="Filter to '+esc(x.name)+'">'
                + '<div class="cg-bar-name">'+esc(x.name)+' <span class="cg-bar-unit">· Unit '+esc(x.unit)+'</span></div>'
                + '<div class="cg-bar-track"><div class="cg-bar-fill" style="width:'+pct+'%"></div></div>'
                + '<div class="cg-bar-val">&#8369;'+x.balance.toLocaleString()+'</div>'
@@ -965,6 +1185,36 @@ function renderInsights() {
     const bk = agingBuckets.find(x => d >= x.min && d <= x.max);
     if(bk){ bk.count++; bk.amt += Math.max(0, billRemaining(b)); }
   }));
+  // ── 5. Net position: collected − expenses, per month ──
+  // Only rendered when the expenses table exists; the whole point is showing
+  // whether all-inclusive rates still clear a margin after utilities.
+  let netCardHtml = '';
+  if(expensesAvailable && _expensesLoadError) {
+    // A transient load failure must not render collected − ₱0 as "profit".
+    netCardHtml = '<div class="insights-card insights-card-net">'
+      + '<div class="insights-card-title">Net Position <span class="insights-card-sub">collected &minus; expenses</span></div>'
+      + '<div class="cg-bar-empty">Expenses could not be loaded — refresh to see real figures.</div>'
+      + '</div>';
+  } else if(expensesAvailable) {
+    const peso = v => '&#8369;'+Math.abs(v).toLocaleString();
+    const netRows = months.map((ym,i) => {
+      const col = collected[i];
+      const exp = _expensesInMonth(ym);
+      const net = col - exp;
+      return '<div class="net-row">'
+        + '<span class="net-mon">'+_ymLabel(ym)+'</span>'
+        + '<span class="net-col" title="Collected">+'+peso(col)+'</span>'
+        + '<span class="net-exp" title="Expenses">&minus;'+peso(exp)+'</span>'
+        + '<span class="net-val '+(net>=0?'pos':'neg')+'">'+(net<0?'&minus;':'')+peso(net)+'</span>'
+        + '</div>';
+    }).join('');
+    netCardHtml = '<div class="insights-card insights-card-net">'
+      + '<div class="insights-card-title">Net Position <span class="insights-card-sub">collected &minus; expenses</span></div>'
+      + '<div class="net-head"><span class="net-mon"></span><span class="net-col">Collected</span><span class="net-exp">Expenses</span><span class="net-val">Net</span></div>'
+      + '<div class="net-rows">'+netRows+'</div>'
+      + '</div>';
+  }
+
   const agingMax = Math.max(1, ...agingBuckets.map(x=>x.amt));
   const agingTotal = agingBuckets.reduce((s,x)=>s+x.amt,0);
   const agingHtml = agingTotal === 0
@@ -972,7 +1222,7 @@ function renderInsights() {
     : '<div class="cg-bars">'
       + agingBuckets.map(x => {
           const pct = (x.amt / agingMax * 100).toFixed(1);
-          return '<div class="cg-bar-row" onclick="filterStatuses=[\'overdue\'];applyFilters()" title="Show overdue bills">'
+          return '<div class="cg-bar-row" role="button" tabindex="0" onkeydown="if(event.key===\'Enter\')this.click()" onclick="filterStatuses=[\'overdue\'];applyFilters()" title="Show overdue bills">'
                + '<div class="cg-bar-name">'+x.label+' <span class="cg-bar-unit">· '+x.count+' bill'+(x.count!==1?'s':'')+'</span></div>'
                + '<div class="cg-bar-track"><div class="cg-bar-fill cg-bar-fill-aging" style="width:'+pct+'%"></div></div>'
                + '<div class="cg-bar-val">&#8369;'+x.amt.toLocaleString()+'</div>'
@@ -1009,10 +1259,184 @@ function renderInsights() {
           +     '<div class="insights-card-title">Overdue Aging <span class="insights-card-sub">how long money has been owed</span></div>'
           +     agingHtml
           +   '</div>'
+          +   netCardHtml
           + '</div>'
           + '</div>'
         : '')
     + '</div>';
+}
+
+// ─────────────────────────────────────────────
+// EXPENSES — what the building actually spends.
+// Once any tenant is on an all-inclusive rate, management shoulders the
+// utilities, so collected-vs-spent is the number that tells the landlord
+// whether the flat rate is actually profitable.
+// ─────────────────────────────────────────────
+const EXPENSE_CATEGORIES = [
+  { key:'electricity', label:'Electricity' },
+  { key:'water',       label:'Water' },
+  { key:'internet',    label:'Internet' },
+  { key:'maintenance', label:'Maintenance' },
+  { key:'taxes',       label:'Taxes & Fees' },
+  { key:'other',       label:'Other' }
+];
+const _expCatLabel = k => (EXPENSE_CATEGORIES.find(c=>c.key===k)||{label:k||'Other'}).label;
+
+function _expYM(){ return expenseMonth || _currentYM(); }
+function _expensesInMonth(ym) {
+  return expenses.reduce((s,x)=>s+((x.expense_date||'').startsWith(ym)?Number(x.amount)||0:0),0);
+}
+function toggleExpenses(){ _expensesOpen = !_expensesOpen; rerenderAdmin(); }
+function setExpenseMonth(v){ expenseMonth = v||''; _editingExpenseId = null; rerenderAdmin(); }
+
+function _expFormHtml(idSuffix, x) {
+  const today = todayISO();
+  return `<div class="exp-form">
+    <div class="exp-form-grid">
+      <div class="field"><label for="exp-date-${idSuffix}">Date</label><input type="date" id="exp-date-${idSuffix}" value="${esc(x?x.expense_date:today)}"></div>
+      <div class="field"><label for="exp-cat-${idSuffix}">Category</label>
+        <select id="exp-cat-${idSuffix}">${EXPENSE_CATEGORIES.map(c=>`<option value="${c.key}"${x&&x.category===c.key?' selected':''}>${c.label}</option>`).join('')}</select>
+      </div>
+      <div class="field"><label for="exp-amount-${idSuffix}">Amount (&#8369;)</label><input type="text" id="exp-amount-${idSuffix}" inputmode="decimal" autocomplete="off" placeholder="0" value="${x?x.amount:''}"></div>
+      <div class="field exp-note-field"><label for="exp-note-${idSuffix}">Note <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted)">(optional)</span></label><input type="text" id="exp-note-${idSuffix}" maxlength="200" placeholder="e.g. BENECO bill for July" value="${esc(x?x.note||'':'')}"></div>
+    </div>
+    <div class="exp-form-actions">
+      ${x?`<button class="btn-cancel" onclick="cancelExpenseEdit()">Cancel</button><button class="btn-save" onclick="saveExpenseEdit('${esc(x.id)}')">Save</button>`
+         :`<button class="btn-save" onclick="addExpense()">+ Add Expense</button>`}
+    </div>
+  </div>`;
+}
+
+function renderExpensesPanel() {
+  const ym = _expYM();
+  const monthLabel = new Date(ym+'-02').toLocaleString('default',{month:'long',year:'numeric'});
+  const monthTotal = _expensesInMonth(ym);
+  const curTotal = _expensesInMonth(_currentYM());
+  const headSub = !expensesAvailable ? 'setup needed'
+    : _expensesLoadError ? 'could not load — refresh'
+    : (curTotal ? '&#8369;'+curTotal.toLocaleString()+' this month' : 'none recorded this month');
+
+  let body = '';
+  if(_expensesOpen) {
+    if(!expensesAvailable) {
+      body = `<div class="insights-body"><div class="exp-setup-note">
+        The expenses table doesn't exist in your database yet.<br>
+        Run <strong>supabase-migration-2.sql</strong> in the Supabase SQL Editor (Dashboard &gt; SQL Editor), then refresh this page.
+      </div></div>`;
+    } else {
+      const loadErrNote = _expensesLoadError
+        ? `<div class="exp-setup-note" style="margin-bottom:12px;">Expenses could not be loaded just now — the list below may be incomplete. Refresh the page to retry.</div>`
+        : '';
+      const monthExpenses = expenses
+        .filter(x=>(x.expense_date||'').startsWith(ym))
+        .slice().sort((a,b)=>(b.expense_date||'').localeCompare(a.expense_date||''));
+      const collected = _collectedInMonth(ym);
+      const net = collected - monthTotal;
+      const shortDate = d => { const dt=new Date(String(d).slice(0,10)+'T00:00:00'); return isNaN(dt.getTime())?String(d):dt.toLocaleDateString('en-PH',{month:'short',day:'numeric'}); };
+      const rows = monthExpenses.length ? monthExpenses.map(x =>
+        _editingExpenseId===x.id
+          ? `<div class="exp-edit-wrap">${_expFormHtml('edit', x)}</div>`
+          : `<div class="exp-row">
+              <span class="exp-date">${shortDate(x.expense_date)}</span>
+              <span class="exp-cat exp-cat-${esc(x.category||'other')}">${esc(_expCatLabel(x.category))}</span>
+              <span class="exp-note">${esc(x.note||'')}</span>
+              <span class="exp-amt">&#8369;${(Number(x.amount)||0).toLocaleString()}</span>
+              <span class="exp-actions">
+                <button class="btn-icon" onclick="editExpense('${esc(x.id)}')" aria-label="Edit">&#9998;</button>
+                <button class="btn-icon del" onclick="deleteExpense('${esc(x.id)}')" aria-label="Delete">&#10005;</button>
+              </span>
+            </div>`).join('')
+        : `<div class="exp-empty">No expenses recorded for ${esc(monthLabel)}.</div>`;
+      body = `<div class="insights-body">
+        ${loadErrNote}
+        <div class="exp-toolbar">
+          <label for="exp-month-filter" class="exp-toolbar-label">Month</label>
+          <input type="month" id="exp-month-filter" value="${ym}" onchange="setExpenseMonth(this.value)">
+          <div class="exp-net ${net>=0?'pos':'neg'}" title="Payments collected minus expenses for ${esc(monthLabel)}">
+            Collected &#8369;${collected.toLocaleString()} &nbsp;&minus;&nbsp; Expenses &#8369;${monthTotal.toLocaleString()} &nbsp;=&nbsp; <strong>Net ${net<0?'&minus;':''}&#8369;${Math.abs(net).toLocaleString()}</strong>
+          </div>
+          <button class="btn-generate" style="margin-left:auto;" onclick="exportExpensesCSV()" title="Export all expenses to CSV">&#128190; Export</button>
+        </div>
+        ${_editingExpenseId?'':_expFormHtml('new', null)}
+        <div class="exp-list">${rows}</div>
+      </div>`;
+    }
+  }
+  return `<div class="insights-panel expense-panel" id="expense-panel">
+    <button class="insights-toggle" onclick="toggleExpenses()" aria-expanded="${_expensesOpen?'true':'false'}">
+      <span class="insights-arrow${_expensesOpen?' open':''}">›</span> Expenses <span class="exp-head-sub">${headSub}</span>
+    </button>
+    ${body}
+  </div>`;
+}
+
+let _expenseSaving = false;
+async function addExpense() {
+  if(_expenseSaving) return; // double-click inserts duplicate rows otherwise
+  const date = document.getElementById('exp-date-new').value;
+  const category = document.getElementById('exp-cat-new').value;
+  const rawAmt = document.getElementById('exp-amount-new').value;
+  const note = document.getElementById('exp-note-new').value.trim();
+  if(!date){ showToast('Please pick the expense date.', false); return; }
+  const amount = normalizeAmount(rawAmt);
+  if(!amount || amount<=0){ showToast('Please enter a valid amount.', false); return; }
+  const rec = { id: uid(), expense_date: date, category, amount, note };
+  _expenseSaving = true;
+  try {
+    await dbInsertExpense(rec);
+    expenses.push(rec);
+    // Jump the panel to the month the expense was filed under so it's visible.
+    expenseMonth = date.slice(0,7)===_currentYM() ? '' : date.slice(0,7);
+    showToast('Expense recorded.');
+    rerenderAdmin();
+  } catch(e) {
+    if(/relation .*expenses|expenses.*does not exist|Could not find the table/i.test(e.message||'')) { expensesAvailable=false; rerenderAdmin(); }
+    else showToast('Save failed: '+e.message, false);
+  } finally { _expenseSaving = false; }
+}
+function editExpense(id){ _editingExpenseId = id; rerenderAdmin(); }
+function cancelExpenseEdit(){ _editingExpenseId = null; rerenderAdmin(); }
+async function saveExpenseEdit(id) {
+  const x = expenses.find(x=>x.id===id); if(!x) return;
+  const date = document.getElementById('exp-date-edit').value;
+  const category = document.getElementById('exp-cat-edit').value;
+  const amount = normalizeAmount(document.getElementById('exp-amount-edit').value);
+  const note = document.getElementById('exp-note-edit').value.trim();
+  if(!date){ showToast('Please pick the expense date.', false); return; }
+  if(!amount || amount<=0){ showToast('Please enter a valid amount.', false); return; }
+  const patch = { expense_date: date, category, amount, note };
+  try {
+    await dbUpdateExpense(id, patch);
+    Object.assign(x, patch);
+    _editingExpenseId = null;
+    showToast('Expense updated.');
+    rerenderAdmin();
+  } catch(e) { showToast('Save failed: '+e.message, false); }
+}
+async function deleteExpense(id) {
+  if(!confirm('Delete this expense?')) return;
+  try {
+    await dbDeleteExpense(id);
+    expenses = expenses.filter(x=>x.id!==id);
+    if(_editingExpenseId===id) _editingExpenseId = null;
+    showToast('Expense deleted.');
+    rerenderAdmin();
+  } catch(e) { showToast('Delete failed: '+e.message, false); }
+}
+function exportExpensesCSV() {
+  if(!expenses.length){ showToast('No expenses to export yet.', false); return; }
+  const rows = [['Date','Category','Amount','Note']];
+  expenses.slice().sort((a,b)=>(a.expense_date||'').localeCompare(b.expense_date||''))
+    .forEach(x=>rows.push([x.expense_date||'', _expCatLabel(x.category), x.amount, x.note||'']));
+  const csv = rows.map(r=>r.map(csvCell).join(',')).join('\n');
+  const blob = new Blob(['﻿'+csv], {type:'text/csv;charset=utf-8'});
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url;
+  a.download = 'expenses-'+todayISO()+'.csv';
+  a.click();
+  URL.revokeObjectURL(url);
+  showToast('Expenses CSV exported ✓');
 }
 
 function renderAdmin() {
@@ -1030,7 +1454,6 @@ function renderAdmin() {
   const collectedThisMonth = _collectedInMonth(curYM);
   const rate = billedThisMonth>0 ? Math.round(collectedThisMonth/billedThisMonth*100) : null;
   const catDue = outstandingByCategory(tenants.flatMap(t=>t.bills));
-  const hasTemplates = tenants.some(t=>(t.templates||[]).length>0);
   document.getElementById('main-content').innerHTML=`
     <div class="page-eyebrow">Dashboard</div>
     <div class="page-title">Tenant Overview</div>
@@ -1042,14 +1465,33 @@ function renderAdmin() {
       <div class="summary-stat"><div class="stat-label">Collection Rate</div><div class="stat-value">${rate===null?'&mdash;':rate+'%'}</div><div class="stat-sub">collected vs billed &middot; ${monthLabel}</div></div>
     </div>
     ${renderInsights()}
-    <div class="pay-inst-card">
-      <div class="pay-inst-head">
-        <div class="pay-inst-label">&#128176; Payment Instructions</div>
-        <button class="btn-pay-inst-edit" onclick="openPayInstModal()">Edit</button>
+    ${renderExpensesPanel()}
+    <div class="settings-cards">
+      <div class="pay-inst-card">
+        <div class="pay-inst-head">
+          <div class="pay-inst-label">&#128176; Payment Instructions</div>
+          <button class="btn-pay-inst-edit" onclick="openPayInstModal()">Edit</button>
+        </div>
+        ${paymentInstructions
+          ? `<div class="pay-inst-preview">${esc(paymentInstructions)}</div>`
+          : `<div class="pay-inst-empty">Not set — tenants will not see payment instructions.</div>`}
       </div>
-      ${paymentInstructions
-        ? `<div class="pay-inst-preview">${esc(paymentInstructions)}</div>`
-        : `<div class="pay-inst-empty">Not set — tenants will not see payment instructions.</div>`}
+      <div class="pay-inst-card">
+        <div class="pay-inst-head">
+          <div class="pay-inst-label">&#128226; Announcements</div>
+          <button class="btn-pay-inst-edit" onclick="openAnnounceModal()">Edit</button>
+        </div>
+        ${announcements
+          ? `<div class="pay-inst-preview">${esc(announcements)}</div>`
+          : `<div class="pay-inst-empty">Not set — the tenant notice board is hidden.</div>`}
+      </div>
+      <div class="pay-inst-card">
+        <div class="pay-inst-head">
+          <div class="pay-inst-label">&#127968; Property</div>
+          <button class="btn-pay-inst-edit" onclick="openBrandingModal()">Edit</button>
+        </div>
+        <div class="pay-inst-preview">${esc(propertyName)}<span style="color:var(--muted)"> · ${esc(propertySubtitle)}</span></div>
+      </div>
     </div>
     ${renderActionRequired()}
     <div class="section-bar">
@@ -1062,7 +1504,7 @@ function renderAdmin() {
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn-generate" onclick="exportCSV()" title="Export all bills to CSV">&#128190; Export CSV</button>
-        ${hasTemplates?'<button class="btn-generate" onclick="openGenModal()">&#128197; Generate Bills</button>':''}
+        <button class="btn-generate" onclick="openGenModal()">&#128197; Generate Bills</button>
         <button class="btn-generate" onclick="openAddModal()">+ Add Tenant</button>
         <button class="btn-add" onclick="openQuickBill()">+ Add Bill</button>
       </div>
@@ -1102,12 +1544,12 @@ function renderAdmin() {
           </div>
         </div>
       </div>
-      <div style="position:relative;display:inline-block;" id="sort-popover-wrap">
+      ${viewMode==='card'?`<div style="position:relative;display:inline-block;" id="sort-popover-wrap">
         <button class="sort-toolbar-btn${sortOrder!=='unit-asc'?' active':''}" onclick="toggleSortPopover()">&#8645; Sort${sortOrder!=='unit-asc'?': '+(SORT_LABELS[sortOrder]||''):''}</button>
         <div class="sort-popover" id="sort-popover">
           ${Object.entries(SORT_LABELS).map(([k,lbl])=>`<button class="sort-option${sortOrder===k?' active':''}" onclick="setSortOrder('${k}')">${lbl}</button>`).join('')}
         </div>
-      </div>
+      </div>`:''}
       ${renderFilterChips()}
     </div>
     <div id="filter-result-note" class="filter-result-note"></div>
@@ -1208,12 +1650,13 @@ async function saveBills(tid, mutate, toastMsg) {
   const billsCopy = structuredClone(t.bills);
   mutate(billsCopy);
   try {
-    await dbUpdate(t.id, {bills: billsCopy});
+    await dbUpdateTenantGuarded(t, {bills: billsCopy});
     t.bills = billsCopy;
     if(toastMsg) showToast(toastMsg);
     return true;
   } catch(e) {
-    showToast('Save failed: '+e.message, false);
+    showToast(e.conflict ? e.message : 'Save failed: '+e.message, false);
+    if(e.conflict){ rerenderAdmin(); return 'conflict'; }
     return false;
   }
 }
@@ -1245,16 +1688,18 @@ function getDueStatus(bill) {
 function getDueUrgencyScore(bill) {
   const s = getDueStatus(bill);
   if(s==='overdue'){
-    // Older overdue sorts first.
+    // Older overdue sorts first. Math.round, not floor: both timestamps are
+    // local midnights, so a DST change makes the diff 23h/25h per boundary
+    // and floor would be off by one.
     const today=new Date(); today.setHours(0,0,0,0);
-    const days = bill.due ? Math.floor((today-new Date(bill.due+'T00:00:00'))/86400000) : 0;
+    const days = bill.due ? Math.round((today-new Date(bill.due+'T00:00:00'))/86400000) : 0;
     return -days;
   }
   if(s==='due-today') return 1;
   if(s==='due-soon')  return 2;
   if(s==='upcoming'){
     const today=new Date(); today.setHours(0,0,0,0);
-    return 3+Math.floor((new Date(bill.due+'T00:00:00')-today)/(86400000));
+    return 3+Math.round((new Date(bill.due+'T00:00:00')-today)/(86400000));
   }
   if(s==='no-date') return 900;
   return 1000; // paid sorts last
@@ -1264,7 +1709,7 @@ function daysOverdue(bill) {
   if(bill.status==='paid' || !bill.due) return 0;
   const today = new Date(); today.setHours(0,0,0,0);
   const d = new Date(bill.due+'T00:00:00');
-  return d < today ? Math.floor((today-d)/86400000) : 0;
+  return d < today ? Math.round((today-d)/86400000) : 0;
 }
 
 // Maps ordinal unit names/numbers to a sortable integer
@@ -1304,6 +1749,7 @@ function renderRows() {
     const tenantHit = t =>
       (t.name||'').toLowerCase().includes(q) ||
       (t.unit||'').toLowerCase().includes(q) ||
+      (t.floor||'').toLowerCase().includes(q) ||
       (t.code||'').toLowerCase().includes(q);
     const billHit = b =>
       (b.label||'').toLowerCase().includes(q) ||
@@ -1378,7 +1824,7 @@ function renderRows() {
 
   const paidFilterOn = filterStatuses.includes('paid');
 
-  c.innerHTML = filtered.map(t=>{
+  const buildCard = t=>{
     // Resolve the original tenant: filtered copies share bill object references,
     // so indexOf against the original array yields the TRUE index for handlers.
     const orig = tenants.find(ot=>ot.id===t.id) || t;
@@ -1394,9 +1840,11 @@ function renderRows() {
       : (trulySettled
           ? `<span style="color:var(--green);font-size:13px;font-family:Inter,sans-serif">Settled</span>`
           : `<span style="color:var(--muted);font-size:13px;font-family:Inter,sans-serif" title="This tenant has unpaid bills hidden by the current filters">&mdash;</span>`);
-    const totalBreak = due ? balanceBreakdownHtml(outstandingByCategory(activeBills)) : '';
+    // All-inclusive tenants have a single rent line; a category breakdown
+    // would just repeat the total.
+    const totalBreak = (due && t.billing_model!=='inclusive') ? balanceBreakdownHtml(outstandingByCategory(activeBills)) : '';
     const hasBalance = orig.bills.some(b=>b.status!=='paid' && billRemaining(b)>0);
-    const actions = `<div class="row-actions"><button class="btn-statement" style="padding:4px 10px;font-size:10px;" onclick="openStmtModalById('${t.id}')" aria-label="Generate statement">Statement</button>${hasBalance?`<button class="btn-icon" onclick="copyReminder('${t.id}')" title="Copy payment reminder" aria-label="Copy payment reminder">&#9993;</button>`:''}<button class="btn-icon" onclick="openQuickBill('${t.id}')" title="Add bill" aria-label="Add bill">&#65291;</button><button class="btn-icon" onclick="openEditModal('${t.id}')" title="Edit tenant" aria-label="Edit">&#9998;</button><button class="btn-icon del" onclick="deleteTenant('${t.id}')" title="Archive tenant" aria-label="Archive">&#10005;</button></div>`;
+    const actions = `<div class="row-actions"><button class="btn-statement" style="padding:4px 10px;font-size:10px;" onclick="openStmtModalById('${t.id}')" aria-label="Generate statement">Statement</button>${hasBalance?`<button class="btn-icon" onclick="copyReminder('${t.id}')" title="Copy payment reminder" aria-label="Copy payment reminder">&#9993;</button>`:''}<button class="btn-icon" onclick="copyPortalLink('${t.id}')" title="Copy portal link (logs the tenant straight in)" aria-label="Copy portal link">&#128279;</button><button class="btn-icon" onclick="openQuickBill('${t.id}')" title="Add bill" aria-label="Add bill">&#65291;</button><button class="btn-icon" onclick="openEditModal('${t.id}')" title="Edit tenant" aria-label="Edit">&#9998;</button><button class="btn-icon del" onclick="deleteTenant('${t.id}')" title="Archive tenant (kept, restorable)" aria-label="Archive">&#128451;</button></div>`;
 
     // Active bill badges sorted by urgency, coloured by derived due-status
     const sortedActive = activeBills.slice().sort((a,b)=>getDueUrgencyScore(a)-getDueUrgencyScore(b));
@@ -1406,7 +1854,10 @@ function renderRows() {
           const ds=getDueStatus(b);
           const rem=Math.max(0,billRemaining(b));
           const tip=`&#8369;${Number(b.amount).toLocaleString()}${b.due?' · due '+formatDate(b.due):''}${b.remark?' · '+esc(b.remark):''} — click to mark paid`;
-          return `<button class="mini-status ${dsBadgeClass(ds)}" onclick="toggleStatus('${t.id}',${bi})" title="${tip}">${esc(b.label)} &#8369;${rem.toLocaleString()}</button>`;
+          // Due date rendered visibly — title tooltips never show on touch
+          // devices, and the phone is where the landlord actually works.
+          const dueBit = b.due ? `<span class="mini-status-due">· ${shortDate(b.due)}</span>` : '';
+          return `<button class="mini-status ${dsBadgeClass(ds)}" onclick="toggleStatus('${t.id}',${bi})" title="${tip}">${esc(b.label)} &#8369;${rem.toLocaleString()} ${dueBit}</button>`;
         }).join('')
       : (orig.bills.some(b=>b.status!=='paid')
           ? `<span style="font-size:11px;color:var(--muted);">No unpaid bills match filters</span>`
@@ -1469,6 +1920,37 @@ function renderRows() {
       </div>
       ${paidSection}
     </div>`;
+  };
+
+  // ── Floor grouping — when tenants carry a floor/group label and the list is
+  // unit-sorted, render group headers with per-floor rollups (tenant count +
+  // real outstanding balance). Other sort orders (balance, urgency) stay flat:
+  // interleaving group headers into a balance-sorted list would be misleading.
+  const _floorRank = s => /\bground\b|^g\/?f\b/i.test(s) ? 0 : unitRank(s);
+  const useFloors = (sortOrder==='unit-asc'||sortOrder==='unit-desc')
+    && filtered.some(t=>(t.floor||'').trim());
+  if(!useFloors){
+    c.innerHTML = filtered.map(buildCard).join('');
+    return;
+  }
+  const groupKeys = []; const groupMap = {};
+  filtered.forEach(t=>{
+    const k = (t.floor||'').trim();
+    if(!(k in groupMap)){ groupMap[k]=[]; groupKeys.push(k); }
+    groupMap[k].push(t);
+  });
+  groupKeys.sort((a,b)=>{
+    if(!a) return 1; if(!b) return -1;           // unassigned tenants sink last
+    const r = _floorRank(a)-_floorRank(b);
+    return (sortOrder==='unit-desc' ? -r : r) || a.localeCompare(b);
+  });
+  c.innerHTML = groupKeys.map(k=>{
+    const list = groupMap[k];
+    // Rollup uses the ORIGINAL tenants so filters can't understate what's owed.
+    const out = list.reduce((s,t)=>{ const orig=tenants.find(ot=>ot.id===t.id)||t; return s+tenantBalance(orig); },0);
+    const meta = `${list.length} tenant${list.length!==1?'s':''} &nbsp;·&nbsp; ${out?'&#8369;'+out.toLocaleString()+' outstanding':'settled'}`;
+    const head = `<div class="floor-group-head"><span class="floor-group-name">${k?esc(k):'Unassigned'}</span><span class="floor-group-meta">${meta}</span></div>`;
+    return head + list.map(buildCard).join('');
   }).join('');
 }
 
@@ -1522,9 +2004,14 @@ function renderTableView(c, filtered) {
       case 'unit':      r = (unitRank(a.tenant.unit) - unitRank(b.tenant.unit)) * dir; break;
       case 'label':     r = (a.bill.label || '').localeCompare(b.bill.label || '') * dir; break;
       case 'amount':    r = ((Number(a.bill.amount) || 0) - (Number(b.bill.amount) || 0)) * dir; break;
-      case 'remaining': r = (billRemaining(a.bill) - billRemaining(b.bill)) * dir; break;
+      case 'remaining': {
+        // Sort by the same value the column displays: paid bills owe 0.
+        const remOf = x => x.status==='paid' ? 0 : Math.max(0, billRemaining(x));
+        r = (remOf(a.bill) - remOf(b.bill)) * dir; break;
+      }
       case 'due':       r = cmpDate(a.bill.due, b.bill.due); break;
       case 'paidDate':  r = cmpDate(a.bill.paidDate, b.bill.paidDate); break;
+      case 'remark':    r = (a.bill.remark || '').localeCompare(b.bill.remark || '') * dir; break;
     }
     // Stable tie-breakers: unit, then due date.
     if (r === 0) r = unitRank(a.tenant.unit) - unitRank(b.tenant.unit);
@@ -1550,8 +2037,9 @@ function renderTableView(c, filtered) {
   const tbody = capped.map(r => {
     const b = r.bill, t = r.tenant;
     const ds = b.status === 'paid' ? 'paid' : getDueStatus(b);
-    const remaining = Math.max(0, billRemaining(b));
     const isPaid = b.status === 'paid';
+    // Paid bills owe nothing, even when partial payments weren't logged.
+    const remaining = isPaid ? 0 : Math.max(0, billRemaining(b));
     const tidAttr = esc(t.id);
     // Status badge toggles paid/unpaid on click (matches card-view behavior).
     const statusBtn = '<button class="mini-status '+dsBadgeClass(ds)+'" '
@@ -1667,16 +2155,19 @@ async function commitAmountEdit(input){
     td.innerHTML = '&#8369;'+original.toLocaleString();
     return;
   }
-  // Commit to DB then update local state and re-render.
+  // Commit to DB then update local state and re-render. Full re-render so
+  // the summary stats, Insights, and Action Required pick up the new amount
+  // too — not just the table rows.
   const billsCopy = structuredClone(t.bills);
   billsCopy[bi].amount = next;
   try {
-    await dbUpdate(t.id, {bills: billsCopy});
+    await dbUpdateTenantGuarded(t, {bills: billsCopy});
     t.bills = billsCopy;
     showToast('Amount updated.');
-    renderRows();
+    rerenderAdmin();
   } catch(e){
-    showToast('Save failed: '+e.message, false);
+    showToast(e.conflict ? e.message : 'Save failed: '+e.message, false);
+    if(e.conflict){ rerenderAdmin(); return; }
     td.innerHTML = '&#8369;'+original.toLocaleString();
   }
 }
@@ -1693,7 +2184,7 @@ async function toggleStatus(tid,bi){
   if(t.bills[bi].status==='paid'){ revertToPending(tid,bi); return; }
   _pendingPaid={tid,bi};
   document.getElementById('paiddate-bill-name').textContent = t.bills[bi].label + ' — ' + t.name;
-  document.getElementById('paiddate-input').value=new Date().toISOString().slice(0,10);
+  document.getElementById('paiddate-input').value=todayISO();
   openModal('paiddate-modal');
 }
 
@@ -1705,17 +2196,33 @@ function closePaidModal(){
 async function confirmPaid(){
   if(!_pendingPaid) return;
   const {tid,bi}=_pendingPaid;
-  closePaidModal();
+  // Save FIRST, close on success. Closing before the save meant a failed
+  // request was only a 2.5-second toast and the admin walked away believing
+  // the payment was recorded.
+  const btn = document.querySelector('#paiddate-modal .btn-save');
+  if(btn && btn.disabled) return; // double-click guard
+  if(btn){ btn.disabled=true; btn.textContent='Saving…'; }
   const dateVal=document.getElementById('paiddate-input').value;
   const ok = await saveBills(tid, bills=>{
     if(!bills[bi]) return;
     bills[bi].status='paid';
-    bills[bi].paidDate=dateVal||new Date().toISOString().slice(0,10);
+    bills[bi].paidDate=dateVal||todayISO();
   }, 'Marked as paid ✓');
-  if(ok) rerenderAdmin();
+  if(btn){ btn.disabled=false; btn.textContent='Confirm Paid'; }
+  // 'conflict' (truthy) also closes: the tenant row was reloaded, so the
+  // remembered bill INDEX may now point at a different bill — retrying the
+  // stale index could mark the wrong bill paid. The admin re-taps instead.
+  if(ok){ closePaidModal(); rerenderAdmin(); }
+  // On a plain failure (no reload) the modal stays open so the admin can retry.
 }
 
 async function revertToPending(tid,bi){
+  // Destructive: clears the recorded paid date, which the Collected insights
+  // key off. A stray tap must not silently rewrite history.
+  const t = tenants.find(t=>t.id===tid);
+  const b = t && t.bills[bi];
+  const when = b && b.paidDate ? ' (paid '+formatDate(b.paidDate)+')' : '';
+  if(!confirm('Move this bill back to unpaid?'+when+' The recorded paid date will be cleared.')) return;
   const ok = await saveBills(tid, bills=>{
     if(!bills[bi]) return;
     bills[bi].status='unpaid';
@@ -1785,6 +2292,11 @@ function switchModalTab(tab,btn){
   if(tab==='templates') renderTemplateList();
 }
 
+// Show the flat-rate field only for the all-inclusive billing model.
+function onBillingModelChange(){
+  const model = document.getElementById('m-billing').value;
+  document.getElementById('m-flatrate-wrap').style.display = model==='inclusive' ? 'block' : 'none';
+}
 function openAddModal(){
   editingId=null;
   document.getElementById('modal-eyebrow').textContent='New Tenant';
@@ -1796,6 +2308,10 @@ function openAddModal(){
   document.getElementById('m-phone').value='';
   document.getElementById('m-email').value='';
   document.getElementById('m-movein').value='';
+  document.getElementById('m-floor').value='';
+  document.getElementById('m-billing').value='itemized';
+  document.getElementById('m-flatrate').value='';
+  onBillingModelChange();
   document.getElementById('modal-tabs').style.display='none';
   document.getElementById('new-tenant-bills').style.display='block';
   document.getElementById('panel-info').classList.add('active');
@@ -1806,6 +2322,7 @@ function openAddModal(){
 }
 function openEditModal(tid){
   const t=tenants.find(t=>t.id===tid); if(!t) return; editingId=tid;
+  _showAllPaidBills = false; // each tenant starts with the compact paid list
   document.getElementById('modal-eyebrow').textContent='Edit Tenant';
   document.getElementById('modal-title').textContent=t.name; // textContent — no HTML-escaping needed
   const saveBtn=document.getElementById('btn-save-tenant'); if(saveBtn) saveBtn.textContent='Save changes';
@@ -1815,6 +2332,10 @@ function openEditModal(tid){
   document.getElementById('m-phone').value=t.phone||'';
   document.getElementById('m-email').value=t.email||'';
   document.getElementById('m-movein').value=t.move_in_date||'';
+  document.getElementById('m-floor').value=t.floor||'';
+  document.getElementById('m-billing').value=t.billing_model==='inclusive'?'inclusive':'itemized';
+  document.getElementById('m-flatrate').value=(t.flat_rate!=null && t.flat_rate!=='')?t.flat_rate:'';
+  onBillingModelChange();
   // Bills tab manages bills via its own UI; billForms is only used for new tenants.
   billForms = [];
   document.getElementById('modal-tabs').style.display='flex';
@@ -1876,7 +2397,12 @@ function billListItemHtml(b, i, extraClass) {
   <div id="bill-edit-inline-${i}" style="display:none"></div>`;
 }
 
+// Remember the expanded/collapsed choice across the instant-save re-renders,
+// so editing a paid bill doesn't collapse the list and hide that very bill.
+let _showAllPaidBills = false;
 function renderBillListItems(showAllPaid){
+  if(showAllPaid===undefined) showAllPaid = _showAllPaidBills;
+  else _showAllPaidBills = !!showAllPaid;
   const t=tenants.find(t=>t.id===editingId); if(!t) return;
   const c=document.getElementById('bill-list-items'); if(!c) return;
   if(!t.bills.length){ c.innerHTML='<div style="text-align:center;padding:24px 0;font-size:13px;color:var(--muted);">No bills yet. Add one below.</div>'; return; }
@@ -1940,7 +2466,7 @@ async function saveBillEdit(i){
   if(_amt===0 && !confirm('Amount is ₱0. Save anyway?')) return;
   const newStatus=document.getElementById('bi-status-'+i).value==='paid'?'paid':'unpaid';
   const pdInput=document.getElementById('bi-paidDate-'+i);
-  const paidDate=newStatus==='paid'?(pdInput?pdInput.value||new Date().toISOString().slice(0,10):new Date().toISOString().slice(0,10)):'';
+  const paidDate=newStatus==='paid'?(pdInput?pdInput.value||todayISO():todayISO()):'';
   let remark=document.getElementById('bi-remark-'+i).value.trim();
   // Auto-clear "pending amount" remark when a real amount is entered
   if(_amt > 0 && remark.toLowerCase().includes('pending amount')) remark = '';
@@ -1998,7 +2524,7 @@ async function saveNewBill(){
   const _nbAmt = normalizeAmount(document.getElementById('nb-amount').value);
   if(_nbAmt===0 && !confirm('Amount is ₱0. Add this bill anyway?')) return;
   const status=document.getElementById('nb-status').value==='paid'?'paid':'unpaid';
-  const paidDate=status==='paid'?(document.getElementById('nb-paidDate').value||new Date().toISOString().slice(0,10)):'';
+  const paidDate=status==='paid'?(document.getElementById('nb-paidDate').value||todayISO()):'';
   const bill={label,amount:normalizeAmount(document.getElementById('nb-amount').value),due:document.getElementById('nb-due').value,status,remark:document.getElementById('nb-remark').value.trim(),scanLink:(function(v){return /^https:\/\//i.test(v)?v:'';})(document.getElementById('nb-scanLink').value.trim()),paidDate,payments:[]};
   const ok = await saveBills(editingId, bills=>{ bills.push(bill); }, 'Bill added.');
   if(ok){ cancelNewBill(); renderBillListItems(); rerenderAdmin(); }
@@ -2033,6 +2559,16 @@ async function saveTenant(){
   const phone=document.getElementById('m-phone').value.trim();
   const email=document.getElementById('m-email').value.trim();
   const move_in_date=document.getElementById('m-movein').value||null;
+  const floor=document.getElementById('m-floor').value.trim();
+  const billing_model=document.getElementById('m-billing').value==='inclusive'?'inclusive':'itemized';
+  const _frRaw=document.getElementById('m-flatrate').value;
+  if(billing_model==='inclusive'){
+    const _frNum = Number(String(_frRaw).replace(/,/g,'').trim());
+    if(String(_frRaw).trim()===''){ showToast('Please enter the monthly flat rate for an all-inclusive tenant.',false); return; }
+    // A typo like "6,5o0" must not silently save as ₱0.
+    if(!isFinite(_frNum) || _frNum < 0){ showToast('Flat rate must be a non-negative number.',false); return; }
+  }
+  const flat_rate=billing_model==='inclusive' ? normalizeAmount(_frRaw) : null;
   if(!name||!unit||!code){showToast('Please fill in name, unit, and access code.',false);return;}
   if(tenants.find(t=>t.code===code&&t.id!==editingId)){showToast('That access code is already in use.',false);return;}
   const savingId = editingId; // capture before closeModal() nullifies it
@@ -2049,7 +2585,7 @@ async function saveTenant(){
       status:   b.status==='paid'?'paid':'unpaid',
       remark:   (b.remark||'').trim(),
       scanLink: /^https:\/\//i.test((b.scanLink||'').trim()) ? (b.scanLink||'').trim() : '',
-      paidDate: b.status==='paid' ? (b.paidDate || new Date().toISOString().slice(0,10)) : '',
+      paidDate: b.status==='paid' ? (b.paidDate || todayISO()) : '',
       payments: []
     }));
     const negative = billForms.find(b=>b.label && Number(String(b.amount||'').replace(/,/g,'')) < 0);
@@ -2060,26 +2596,42 @@ async function saveTenant(){
     if(zeroBill && !confirm('Bill "' + zeroBill.label + '" has amount ₱0. Save anyway?')) return;
   }
   const existingTemplates = savingId ? (tenants.find(t=>t.id===savingId)?.templates||[]) : [];
+  // All-inclusive tenants get a monthly bill template automatically when they
+  // have none, so Generate Bills covers them from day one. Billing day comes
+  // from the first bill's due date, else the move-in date, else the 1st.
+  let templates = existingTemplates.slice();
+  let autoTemplate = false;
+  if(billing_model==='inclusive' && flat_rate>0 && !templates.length){
+    const _dayOf = s => { const d=Number(String(s||'').slice(8,10)); return d>=1&&d<=31?d:0; };
+    const day = _dayOf((bills.find(b=>b.due)||{}).due) || _dayOf(move_in_date) || 1;
+    templates.push({id:uid(), label:'Monthly Rent (All-Inclusive)', amount:flat_rate, dayOfMonth:day, pendingAmount:false});
+    autoTemplate = true;
+  }
+  const fields = {name,unit,code,phone,email,move_in_date,floor,billing_model,flat_rate,bills,templates};
   setLoading(true, savingId?'Saving changes…':'Adding tenant…');
   try {
     if(savingId){
-      await dbUpdate(savingId,{name,unit,code,phone,email,move_in_date,bills,templates:existingTemplates});
-      tenants=tenants.map(t=>t.id===savingId?{...t,name,unit,code,phone,email,move_in_date,bills,templates:existingTemplates}:t);
+      const tObj = tenants.find(t=>t.id===savingId);
+      await dbUpdateTenantGuarded(tObj, fields);
+      tenants=tenants.map(t=>t.id===savingId?{...t,...fields}:t);
       setLoading(false);
       closeModal();
-      showToast('Changes saved.');
+      showToast(autoTemplate?'Changes saved — monthly bill template created.':'Changes saved.');
     } else {
-      const rec={id:uid(),name,unit,code,phone,email,move_in_date,bills,templates:[]};
-      await dbInsert(rec);
-      tenants.push(rec);
+      const rec={id:uid(),...fields};
+      // Use the returned row so server defaults (rev, etc.) are in memory.
+      const inserted = await dbInsert(rec);
+      tenants.push(_normalizeTenant((inserted && inserted[0]) || rec));
       setLoading(false);
       closeModal();
-      showToast('Tenant added.');
+      showToast(autoTemplate?'Tenant added — monthly bill template created.':'Tenant added.');
     }
     rerenderAdmin();
   } catch(e){
     setLoading(false);
-    showToast('Error: '+e.message, false);
+    if(e.conflict){ showToast(e.message, false); closeModal(); rerenderAdmin(); }
+    else if(/billing_model|flat_rate|floor/.test(e.message||'')) alert(SCHEMA2_NOTE);
+    else showToast('Error: '+e.message, false);
     // Modal stays open so the admin can correct and retry without re-typing.
   }
 }
@@ -2118,7 +2670,7 @@ function closeQuickBill(){ closeModalEl('addbill-modal'); }
 function qbTogglePaid(cb){
   document.getElementById('qb-paiddate-wrap').style.display = cb.checked ? 'block' : 'none';
   if(cb.checked && !document.getElementById('qb-paiddate').value){
-    document.getElementById('qb-paiddate').value = new Date().toISOString().slice(0,10);
+    document.getElementById('qb-paiddate').value = todayISO();
   }
 }
 // When the label matches one of this tenant's templates, prefill amount and due date.
@@ -2154,7 +2706,7 @@ async function saveQuickBill(addAnother){
     if(dup && !confirm(t.name+' already has a "'+label+'" bill due '+new Date(due.slice(0,7)+'-02').toLocaleString('default',{month:'long',year:'numeric'})+'. Add another?')) return;
   }
   const isPaid = document.getElementById('qb-paid').checked;
-  const paidDate = isPaid ? (document.getElementById('qb-paiddate').value || new Date().toISOString().slice(0,10)) : '';
+  const paidDate = isPaid ? (document.getElementById('qb-paiddate').value || todayISO()) : '';
   const scan = document.getElementById('qb-scan').value.trim();
   const bill = { label, amount, due, status: isPaid?'paid':'unpaid',
     remark: document.getElementById('qb-remark').value.trim(),
@@ -2229,6 +2781,37 @@ function renderTenant(){
   const totalDue       = allActiveBills.reduce((s,b)=>s+Math.max(0,billRemaining(b)),0);
   const catDue         = outstandingByCategory(allActiveBills);
 
+  // ── All-inclusive tenants: one predictable number, so the header answers
+  // "am I paid up this month?" instead of repeating the same figure 3 times.
+  const isInclusive = t.billing_model==='inclusive';
+  const _tmplRate = (t.templates||[]).find(x=>/rent/i.test(x.label||'')) || (t.templates||[])[0];
+  const flatRate = Number(t.flat_rate) || (_tmplRate && !_tmplRate.pendingAmount ? Number(_tmplRate.amount) : 0) || 0;
+  const monthName = now.toLocaleString('default',{month:'long'});
+  const curMonthBills  = t.bills.filter(b=>b.due&&b.due.startsWith(curYM));
+  const curMonthUnpaid = curMonthBills.filter(b=>b.status!=='paid');
+  const curMonthPaid   = curMonthBills.filter(b=>b.status==='paid');
+  const pastDue        = allActiveBills.filter(b=>!(b.due&&b.due.startsWith(curYM)))
+                          .reduce((s,b)=>s+Math.max(0,billRemaining(b)),0);
+  let monthCardValue='', monthCardSub='', monthCardCls='';
+  if(curMonthUnpaid.length){
+    const most = curMonthUnpaid.slice().sort((a,b)=>getDueUrgencyScore(a)-getDueUrgencyScore(b))[0];
+    const ds = getDueStatus(most);
+    monthCardValue = '&#8369;'+thisMonthDue.toLocaleString();
+    monthCardCls = (ds==='overdue'||ds==='due-today') ? 'overdue' : '';
+    monthCardSub = ds==='overdue' ? 'Overdue — was due '+formatDate(most.due)
+                 : ds==='due-today' ? 'Due today'
+                 : 'Due '+formatDate(most.due);
+  } else if(curMonthPaid.length){
+    const lastPaid = curMonthPaid.slice().sort((a,b)=>(b.paidDate||'').localeCompare(a.paidDate||''))[0];
+    monthCardValue = 'Paid &#10003;';
+    monthCardCls = 'clear';
+    monthCardSub = lastPaid.paidDate ? 'on '+formatDate(lastPaid.paidDate) : 'Thank you!';
+  } else {
+    monthCardValue = 'No bill yet';
+    monthCardCls = 'clear';
+    monthCardSub = flatRate ? ('&#8369;'+flatRate.toLocaleString()+' expected for '+monthName) : ('Nothing posted for '+monthName+' yet');
+  }
+
   // Month pill list — derive from all bills with a due date
   const monthSet = new Set();
   t.bills.filter(b=>b.due&&b.status!=='paid').forEach(b=>monthSet.add(b.due.slice(0,7)));
@@ -2236,19 +2819,30 @@ function renderTenant(){
 
   // Resolve active filter month
   const activeYM = portalMonth==='current' ? curYM : portalMonth;
-  const emptyMsg = portalMonth==='all' ? 'All bills are settled.' : ('No bills for '+new Date(activeYM+'-02').toLocaleString('default',{month:'long',year:'numeric'})+'.');
-  const footerLabel = portalMonth!=='all' ? 'Balance Due (shown)' : 'Balance Due';
+  const activeMonthName = portalMonth==='all' ? '' : new Date(activeYM+'-02').toLocaleString('default',{month:'long',year:'numeric'});
+  const footerLabel = portalMonth!=='all' ? 'Due for '+activeMonthName.split(' ')[0] : 'Total Balance Due';
 
-  // Filter + sort active bills for display
+  // Filter + sort active bills for display. Bills with NO due date are shown
+  // in every view — they're open obligations that belong to no month, and
+  // hiding them behind the 'All' pill made them effectively invisible.
   function sortByUrgency(bills) {
     return bills.slice().sort((a,b)=>getDueUrgencyScore(a)-getDueUrgencyScore(b));
   }
   const activeBills = sortByUrgency(
     portalMonth==='all'
       ? allActiveBills
-      : allActiveBills.filter(b=>b.due&&b.due.startsWith(activeYM))
+      : allActiveBills.filter(b=>!b.due || b.due.startsWith(activeYM))
   );
   const due = activeBills.reduce((s,b)=>s+Math.max(0,billRemaining(b)),0);
+  const hiddenDue = totalDue - due; // owed in months outside the current view
+  // A tenant with only old debt must still be able to reach it: show the
+  // pills whenever any owing month differs from the current one.
+  const showPills = monthList.length > 1 || (monthList.length===1 && monthList[0]!==curYM);
+  const emptyMsg = portalMonth==='all'
+    ? 'All bills are settled.'
+    : (hiddenDue>0
+        ? 'No unpaid bills for '+activeMonthName+' — but &#8369;'+hiddenDue.toLocaleString()+' is still owed from other months.<br><button class="btn-statement" style="margin-top:10px;" onclick="setPortalMonth(\'all\')">View all bills</button>'
+        : 'No bills for '+activeMonthName+'.');
 
   function dueMeta(b) {
     const s = getDueStatus(b);
@@ -2316,8 +2910,34 @@ function renderTenant(){
       <div class="page-title">${esc(t.name)}</div>
       <div class="portal-pull">
         <div class="portal-pull-text">"Your bills, clearly laid out."</div>
-        <div class="portal-pull-sub">Unit ${esc(t.unit)} &nbsp;·&nbsp; Contact management if anything looks incorrect.</div>
+        <div class="portal-pull-sub">Unit ${esc(t.unit)}${isInclusive?' &nbsp;·&nbsp; All-inclusive rate':''} &nbsp;·&nbsp; Contact management if anything looks incorrect.</div>
       </div>
+      ${announcements?`
+      <div class="portal-announce">
+        <div class="portal-announce-eyebrow">&#128226; Announcements</div>
+        <div class="portal-announce-body">${esc(announcements)}</div>
+      </div>`:''}
+      ${isInclusive&&flatRate?`
+      <div class="portal-rate-banner">
+        <div class="portal-rate-main">
+          <div class="portal-rate-label">Your Monthly Rate</div>
+          <div class="portal-rate-value">&#8369;${flatRate.toLocaleString()}<span class="portal-rate-per">/month</span></div>
+        </div>
+        <div class="portal-rate-sub">All-inclusive &mdash; water &amp; electricity are covered. You'll never receive a separate utility bill.</div>
+      </div>`:''}
+      ${isInclusive?`
+      <div class="portal-balance-strip inclusive-strip">
+        <div class="portal-bal-stat">
+          <div class="portal-bal-label">${esc(monthName)}</div>
+          <div class="portal-bal-value ${monthCardCls}">${monthCardValue}</div>
+          <div class="portal-bal-sub">${monthCardSub}</div>
+        </div>
+        <div class="portal-bal-stat">
+          <div class="portal-bal-label">Past Due</div>
+          <div class="portal-bal-value ${pastDue>0?'overdue':'clear'}">${pastDue?'&#8369;'+pastDue.toLocaleString():'None'}</div>
+          <div class="portal-bal-sub">${pastDue?'from earlier months &mdash; listed below':'you are fully caught up'}</div>
+        </div>
+      </div>`:`
       <div class="portal-balance-strip">
         <div class="portal-bal-stat">
           <div class="portal-bal-label">This Month</div>
@@ -2332,22 +2952,27 @@ function renderTenant(){
           <div class="portal-bal-value ${totalDue===0?'clear':''}">${totalDue?'&#8369;'+totalDue.toLocaleString():'Settled'}</div>
           ${totalDue?`<div class="portal-bal-break">${balanceLinesHtml(catDue,'portal-bal-line')}</div>`:''}
         </div>
-      </div>
+      </div>`}
       <div class="bills-card">
         <div class="bills-card-head">
           <div class="bills-card-head-row">
-            <div class="bills-card-title">Statement of Account</div>
-            <div class="bills-count">${activeBills.length} bill${activeBills.length!==1?'s':''}</div>
+            <div class="bills-card-title">Your Bills</div>
+            <div style="display:flex;gap:10px;align-items:center;">
+              ${!paidBills.length&&t.bills.length?`<button onclick="openStmtModal(currentUser)" class="btn-statement" style="font-size:11px;">Generate Statement</button>`:''}
+              <div class="bills-count">${activeBills.length} bill${activeBills.length!==1?'s':''}</div>
+            </div>
           </div>
-          ${monthList.length > 1 ? monthPills : ''}
+          ${showPills ? monthPills : ''}
         </div>
         ${activeBills.length
           ? activeBills.map(billRow).join('')
-          : `<div class="empty-state" style="padding:32px 24px"><div class="icon" style="font-size:24px;margin-bottom:8px">&#10003;</div><p>${emptyMsg}</p></div>`}
+          : `<div class="empty-state" style="padding:32px 24px"><div class="icon" style="font-size:24px;margin-bottom:8px">${portalMonth!=='all'&&hiddenDue>0?'&#9888;':'&#10003;'}</div><p>${emptyMsg}</p></div>`}
         <div class="bills-footer">
-          <div class="footer-label">${footerLabel}</div>
+          <div>
+            <div class="footer-label">${footerLabel}</div>
+            ${portalMonth!=='all'&&hiddenDue>0?`<div class="footer-alltime">Total owed, all months: <strong>&#8369;${totalDue.toLocaleString()}</strong></div>`:''}
+          </div>
           <div class="footer-total">${due?'&#8369;'+due.toLocaleString():'Settled'}</div>
-
         </div>
       </div>
       ${paymentInstructions ? `
@@ -2374,12 +2999,20 @@ function uid() {
   return Array.from(arr, b=>b.toString(16).padStart(2,'0')).join('');
 }
 function normalizeAmount(val) {
-  // Accept "1,234.50" plus plain numbers; reject negatives.
+  // Accept "1,234.50" plus plain numbers; reject negatives and non-finite
+  // values ("Infinity" JSON-serializes to null and would wipe the amount).
   if(val == null) return 0;
   const cleaned = String(val).replace(/,/g,'').trim();
   const n = Number(cleaned);
-  if(isNaN(n) || n < 0) return 0;
+  if(!isFinite(n) || n < 0) return 0;
   return Math.round(n * 100) / 100;
+}
+
+// Today as YYYY-MM-DD in the USER'S timezone. toISOString() is UTC, which
+// stamped yesterday's date on payments recorded before 8 AM Philippine time.
+function todayISO() {
+  const d = new Date();
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
 }
 
 function randCode(){
@@ -2396,21 +3029,45 @@ function formatDate(d) {
   const dt = new Date(dateStr+'T00:00:00');
   if(isNaN(dt.getTime())) {
     console.warn('formatDate: invalid date', d);
-    return String(d);
+    // Escaped: this return value flows into innerHTML sinks, and echoing a
+    // malformed value raw would be a stored-XSS foothold.
+    return esc(String(d));
   }
   return dt.toLocaleDateString('en-PH',{month:'long',day:'numeric',year:'numeric'});
 }
+// Compact date for tight UI (badges, expense rows): "Aug 5"
+function shortDate(d) {
+  if(!d) return '';
+  const dt = new Date(String(d).slice(0,10)+'T00:00:00');
+  if(isNaN(dt.getTime())) return esc(String(d));
+  return dt.toLocaleDateString('en-PH',{month:'short',day:'numeric'});
+}
+let _portalSettingsPromise = null;
 document.addEventListener('DOMContentLoaded',()=>{
   const _wire = (id, fn) => { const el=document.getElementById(id); if(el) el.addEventListener('click',e=>{if(e.target===el)fn();}); };
   _wire('tenant-modal',  closeModal);
   _wire('paiddate-modal', closePaidModal);
   _wire('payinst-modal', closePayInstModal);
+  _wire('announce-modal', closeAnnounceModal);
+  _wire('branding-modal', closeBrandingModal);
   _wire('stmt-modal',    closeStmtModal);
   _wire('genbills-modal', closeGenModal);
   _wire('addbill-modal', closeQuickBill);
 
+  // Apply the cached property name instantly (no flash of the default),
+  // then refresh from the server in the background.
+  try {
+    const cached = JSON.parse(localStorage.getItem('oa_branding'));
+    if(cached && cached.name) { propertyName = cached.name; propertySubtitle = cached.sub || propertySubtitle; }
+  } catch {}
+  applyBranding();
+  _portalSettingsPromise = loadPortalSettings().catch(()=>{});
+
   // Detect Supabase password recovery redirect
   checkPasswordRecovery();
+
+  // Silent login from a portal link or a remembered code.
+  tryAutoLogin();
 });
 
 async function checkPasswordRecovery() {
@@ -2508,12 +3165,36 @@ function buildReminderText(t){
       + partial;
   });
   const total = active.reduce((s,b)=>s+Math.max(0,billRemaining(b)),0);
-  return 'Hi '+t.name+', this is a friendly reminder from Orange Apartment.\n\n'
+  return 'Hi '+t.name+', this is a friendly reminder from '+propertyName+'.\n\n'
     + 'Outstanding bills for Unit '+t.unit+':\n'
     + lines.join('\n') + '\n\n'
     + 'Total due: ₱'+total.toLocaleString()
     + (paymentInstructions ? '\n\nHow to pay:\n'+paymentInstructions : '')
+    + '\n\nView your bills anytime: '+portalLinkFor(t)
     + '\n\nThank you!';
+}
+
+// One-tap portal link for a tenant — the code in the URL logs them straight in.
+function portalLinkFor(t){
+  return window.location.origin + window.location.pathname + '?code=' + encodeURIComponent(t.code);
+}
+async function copyPortalLink(tid){
+  const t = tenants.find(t=>t.id===tid); if(!t) return;
+  const link = portalLinkFor(t);
+  const done = () => showToast('Portal link for '+t.name+' copied — send it via SMS / Messenger / Viber.');
+  try {
+    await navigator.clipboard.writeText(link);
+    done();
+  } catch {
+    const ta = document.createElement('textarea');
+    ta.value = link;
+    ta.style.cssText = 'position:fixed;left:-9999px;';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); done(); }
+    catch { showToast('Could not copy automatically.', false); }
+    ta.remove();
+  }
 }
 async function copyReminder(tid){
   const t = tenants.find(t=>t.id===tid); if(!t) return;
@@ -2542,7 +3223,7 @@ function quickMarkPaid(tid, bi) {
   if(!t||!t.bills[bi]) return;
   _pendingPaid = {tid, bi};
   document.getElementById('paiddate-bill-name').textContent = t.bills[bi].label + ' — ' + t.name;
-  document.getElementById('paiddate-input').value = new Date().toISOString().slice(0,10);
+  document.getElementById('paiddate-input').value = todayISO();
   openModal('paiddate-modal');
 }
 
@@ -2551,6 +3232,7 @@ function quickMarkPaid(tid, bi) {
 // ─────────────────────────────────────────────
 const SCHEMA_NOTE = 'Templates column missing in Supabase. Run this SQL in your Supabase dashboard:\n\nALTER TABLE tenants ADD COLUMN IF NOT EXISTS templates jsonb NOT NULL DEFAULT \'[]\';\n\nThen refresh and try again.';
 // Error message for missing templates column
+const SCHEMA2_NOTE = 'Your database is missing the v2 columns (billing model / flat rate / floor).\n\nRun supabase-migration-2.sql in the Supabase SQL Editor (Dashboard > SQL Editor), then refresh and try again.';
 
 function renderTemplateList() {
   const t = tenants.find(t=>t.id===editingId); if(!t) return;
@@ -2609,36 +3291,45 @@ function templateSaveErr(e) {
 
 async function saveTemplateEdit(i) {
   const _isPending = (function(){ const el=document.getElementById('te-pending-'+i); return el?el.checked:false; })();
-  const amt = _isPending ? 1 : Number(document.getElementById('te-amount-'+i).value);
+  // Parse like every other money field: commas allowed, negatives rejected.
+  const amtRaw = document.getElementById('te-amount-'+i).value;
+  const amtNum = Number(String(amtRaw).replace(/,/g,'').trim());
+  if(!_isPending && (isNaN(amtNum) || amtNum < 0)){ showToast('Amount must be a non-negative number.', false); return; }
+  const amt = _isPending ? 0 : normalizeAmount(amtRaw);
   if(!_isPending&&amt===0){if(!confirm('The amount is currently set to ₱0. Save anyway?')) return;}
   const day = Number(document.getElementById('te-day-'+i).value);
   if(!day||day<1||day>31){showToast('Due day must be between 1 and 31.',false);return;}
   const t = tenants.find(t=>t.id===editingId); if(!t||!t.templates||!t.templates[i]) return;
-  t.templates[i] = {
-    ...t.templates[i],
+  // Copy → save → commit, so a failed request never leaves the UI diverged.
+  const templatesCopy = structuredClone(t.templates);
+  templatesCopy[i] = {
+    ...templatesCopy[i],
     label:  document.getElementById('te-label-'+i).value.trim(),
-    amount: _isPending ? 0 : amt, dayOfMonth: day,
+    amount: amt, dayOfMonth: day,
     pendingAmount: _isPending
   };
   try {
-    await dbUpdate(t.id,{templates:t.templates});
+    await dbUpdateTenantGuarded(t, {templates: templatesCopy});
+    t.templates = templatesCopy;
     tenants = tenants.map(x=>x.id===t.id?t:x);
     showToast('Template saved.');
     renderTemplateList();
-  } catch(e){ templateSaveErr(e); }
+  } catch(e){ if(e.conflict){ showToast(e.message,false); renderTemplateList(); rerenderAdmin(); } else templateSaveErr(e); }
 }
 
 async function deleteTemplate(i) {
   if(!confirm('Delete this template?')) return;
   const t = tenants.find(t=>t.id===editingId); if(!t||!t.templates) return;
-  t.templates.splice(i,1);
+  const templatesCopy = structuredClone(t.templates);
+  templatesCopy.splice(i,1);
   try {
-    await dbUpdate(t.id,{templates:t.templates});
+    await dbUpdateTenantGuarded(t, {templates: templatesCopy});
+    t.templates = templatesCopy;
     tenants = tenants.map(x=>x.id===t.id?t:x);
     showToast('Template deleted.');
     renderTemplateList();
     rerenderAdmin();
-  } catch(e){ templateSaveErr(e); }
+  } catch(e){ if(e.conflict){ showToast(e.message,false); renderTemplateList(); rerenderAdmin(); } else templateSaveErr(e); }
 }
 
 function startNewTemplate() {
@@ -2670,21 +3361,27 @@ async function saveNewTemplate() {
   const label = document.getElementById('nt-label').value.trim();
   if(!label){showToast('Please enter a template description.',false);return;}
   const _ntPending = document.getElementById('nt-pending') && document.getElementById('nt-pending').checked;
-  const amt = _ntPending ? 1 : Number(document.getElementById('nt-amount').value);
+  const amtRaw = document.getElementById('nt-amount').value;
+  const amtNum = Number(String(amtRaw).replace(/,/g,'').trim());
+  if(!_ntPending && (isNaN(amtNum) || amtNum < 0)){ showToast('Amount must be a non-negative number.', false); return; }
+  const amt = _ntPending ? 0 : normalizeAmount(amtRaw);
   if(!_ntPending&&amt===0){ showToast('Note: amount is set to ₱0.',true); }
   const day = Number(document.getElementById('nt-day').value);
   if(!day||day<1||day>31){showToast('Due day must be between 1 and 31.',false);return;}
   const t = tenants.find(t=>t.id===editingId); if(!t) return;
-  if(!t.templates) t.templates=[];
-  t.templates.push({id:uid(), label, amount:_ntPending?0:amt, dayOfMonth:day, pendingAmount:_ntPending});
+  // Copy → save → commit: a failed save must not leave a phantom template
+  // in memory that a later save would silently persist.
+  const templatesCopy = structuredClone(t.templates || []);
+  templatesCopy.push({id:uid(), label, amount:amt, dayOfMonth:day, pendingAmount:_ntPending});
   try {
-    await dbUpdate(t.id,{templates:t.templates});
+    await dbUpdateTenantGuarded(t, {templates: templatesCopy});
+    t.templates = templatesCopy;
     tenants = tenants.map(x=>x.id===t.id?t:x);
     showToast('Template added.');
     cancelNewTemplate();
     renderTemplateList();
     rerenderAdmin();
-  } catch(e){ templateSaveErr(e); }
+  } catch(e){ if(e.conflict){ showToast(e.message,false); renderTemplateList(); rerenderAdmin(); } else templateSaveErr(e); }
 }
 
 // ─────────────────────────────────────────────
@@ -2778,14 +3475,21 @@ async function confirmGenerateBills() {
 
   setLoading(true,'Generating bills…');
   try {
-    await Promise.all(pending.map(p => dbUpdate(p.tenant.id, {bills: p.newBills})));
+    // Guarded per-tenant: generation must not overwrite payments recorded
+    // from another device, nor write without bumping rev (which would let a
+    // stale tab clobber the generated bills later without any conflict).
+    await Promise.all(pending.map(p => dbUpdateTenantGuarded(p.tenant, {bills: p.newBills})));
     // Commit local state only after every save succeeded.
     pending.forEach(p => { p.tenant.bills = p.newBills; });
     setLoading(false);
     closeGenModal();
     showToast('Bills generated ✓');
     rerenderAdmin();
-  } catch(e){ setLoading(false); showToast('Error: '+e.message, false); }
+  } catch(e){
+    setLoading(false);
+    if(e.conflict){ showToast(e.message, false); closeGenModal(); rerenderAdmin(); }
+    else showToast('Error: '+e.message, false);
+  }
 }
 
 
@@ -2846,14 +3550,14 @@ function renderFilterChips() {
   const statusLabels = {overdue:'Overdue','due-today':'Due Today','due-soon':'Due Soon',upcoming:'Upcoming',paid:'Paid'};
   if (filterTenantId) {
     const t = tenants.find(t=>t.id===filterTenantId);
-    if (t) chips.push('<span class="filter-chip">'+esc(t.name)+'<button class="filter-chip-x" onclick="filterTenantId=\'\';applyFilters()">&#10005;</button></span>');
+    if (t) chips.push('<span class="filter-chip">'+esc(t.name)+'<button class="filter-chip-x" aria-label="Remove tenant filter" onclick="filterTenantId=\'\';applyFilters()">&#10005;</button></span>');
   }
   if (filterMonth) {
     const lbl = new Date(filterMonth+'-02').toLocaleString('default',{month:'short',year:'numeric'});
-    chips.push('<span class="filter-chip">'+lbl+'<button class="filter-chip-x" onclick="filterMonth=\'\';applyFilters()">&#10005;</button></span>');
+    chips.push('<span class="filter-chip">'+lbl+'<button class="filter-chip-x" aria-label="Remove month filter" onclick="filterMonth=\'\';applyFilters()">&#10005;</button></span>');
   }
   filterStatuses.forEach(s => {
-    chips.push('<span class="filter-chip">'+(statusLabels[s]||s)+'<button class="filter-chip-x" onclick="removeFilterStatus(\''+s+'\')">&#10005;</button></span>');
+    chips.push('<span class="filter-chip">'+(statusLabels[s]||s)+'<button class="filter-chip-x" aria-label="Remove status filter" onclick="removeFilterStatus(\''+s+'\')">&#10005;</button></span>');
   });
   return chips.join('');
 }
@@ -2930,7 +3634,17 @@ document.addEventListener('click', function(e) {
 // ─────────────────────────────────────────────
 // PAYMENT INSTRUCTIONS
 // ─────────────────────────────────────────────
+// Editing settings whose load failed would overwrite the real saved values
+// with the blanks on screen — refuse until a reload succeeds.
+function _guardSettingsEdit() {
+  if(_settingsLoadFailed) {
+    showToast('Settings failed to load, so editing now could overwrite your saved values with blanks. Please refresh the page first.', false);
+    return false;
+  }
+  return true;
+}
 function openPayInstModal() {
+  if(!_guardSettingsEdit()) return;
   document.getElementById('payinst-textarea').value = paymentInstructions || '';
   document.getElementById('payinst-error').style.display = 'none';
   openModal('payinst-modal');
@@ -2947,6 +3661,69 @@ async function savePayInst() {
     paymentInstructions = val;
     closePayInstModal();
     showToast('Payment instructions saved.');
+    rerenderAdmin();
+  } catch(e) {
+    errEl.textContent = 'Save failed. Make sure the settings table exists in Supabase.';
+    errEl.style.display = 'block';
+  }
+}
+
+// ─────────────────────────────────────────────
+// ANNOUNCEMENTS (tenant notice board)
+// ─────────────────────────────────────────────
+function openAnnounceModal() {
+  if(!_guardSettingsEdit()) return;
+  document.getElementById('announce-textarea').value = announcements || '';
+  document.getElementById('announce-error').style.display = 'none';
+  openModal('announce-modal');
+}
+function closeAnnounceModal() {
+  closeModalEl('announce-modal');
+}
+async function saveAnnouncements() {
+  const val = document.getElementById('announce-textarea').value.trim();
+  const errEl = document.getElementById('announce-error');
+  errEl.style.display = 'none';
+  try {
+    await dbSetSetting('announcements', val);
+    announcements = val;
+    closeAnnounceModal();
+    showToast(val ? 'Announcements saved — tenants will see them on their portal.' : 'Announcements cleared.');
+    rerenderAdmin();
+  } catch(e) {
+    errEl.textContent = 'Save failed. Make sure the settings table exists in Supabase.';
+    errEl.style.display = 'block';
+  }
+}
+
+// ─────────────────────────────────────────────
+// BRANDING (property name — makes the portal reusable for any building)
+// ─────────────────────────────────────────────
+function openBrandingModal() {
+  if(!_guardSettingsEdit()) return;
+  document.getElementById('branding-name').value = propertyName;
+  document.getElementById('branding-sub').value = propertySubtitle;
+  document.getElementById('branding-error').style.display = 'none';
+  openModal('branding-modal');
+}
+function closeBrandingModal() {
+  closeModalEl('branding-modal');
+}
+async function saveBranding() {
+  const name = document.getElementById('branding-name').value.trim();
+  const sub  = document.getElementById('branding-sub').value.trim();
+  const errEl = document.getElementById('branding-error');
+  errEl.style.display = 'none';
+  if(!name){ errEl.textContent = 'Property name cannot be empty.'; errEl.style.display = 'block'; return; }
+  try {
+    await dbSetSetting('property_name', name);
+    await dbSetSetting('property_subtitle', sub);
+    propertyName = name;
+    propertySubtitle = sub || 'Tenant Billing Portal';
+    try { localStorage.setItem('oa_branding', JSON.stringify({ name: propertyName, sub: propertySubtitle })); } catch {}
+    applyBranding();
+    closeBrandingModal();
+    showToast('Property name saved.');
     rerenderAdmin();
   } catch(e) {
     errEl.textContent = 'Save failed. Make sure the settings table exists in Supabase.';
@@ -2982,30 +3759,44 @@ function showFullTimeline(expand) {
 // ─────────────────────────────────────────────
 // F-15: CSV EXPORT + PRINT VIEW
 // ─────────────────────────────────────────────
+// Quote a CSV cell. Values that a spreadsheet would execute as a formula
+// (=..., +..., @..., tab/CR-prefixed) get a leading apostrophe so a bill
+// label like "=HYPERLINK(...)" can never run when the export is opened in
+// Excel/Sheets. Plain numbers are exempt so amounts stay numeric.
+function csvCell(v){
+  let s = String(v==null?'':v).replace(/"/g,'""');
+  if(/^[=+@\t\r-]/.test(s) && String(v).trim()!=='' && isNaN(Number(String(v)))) s = "'"+s;
+  return '"'+s+'"';
+}
 function exportCSV() {
   const dsLabel = { paid:'Paid', overdue:'Overdue', 'due-today':'Due Today', 'due-soon':'Due Soon', upcoming:'Upcoming', 'no-date':'Unscheduled' };
-  const rows = [['Tenant Name','Unit','Access Code','Bill Label','Amount','Amount Paid','Remaining','Due Date','Status','Paid Date','Remark']];
+  const rows = [['Tenant Name','Unit','Floor','Billing Model','Access Code','Bill Label','Amount','Amount Paid','Remaining','Due Date','Status','Paid Date','Remark']];
   tenants.forEach(t => {
+    const base = [t.name, t.unit, t.floor||'', t.billing_model==='inclusive'?'All-inclusive':'Itemized', t.code];
     if(!t.bills||!t.bills.length){
-      rows.push([t.name,t.unit,t.code,'','','','','','','','']);
+      rows.push([...base,'','','','','','','','']);
     } else {
       t.bills.forEach(b => {
-        const paid = billTotalPaid(b);
-        const remaining = billRemaining(b);
+        // A bill marked paid is settled in full even when partial payments
+        // weren't logged — mirror the statement's paidOf/balOf rules so the
+        // export never claims money is still owed on a paid bill.
+        const paid = b.status==='paid' ? Number(b.amount||0) : billTotalPaid(b);
+        const remaining = b.status==='paid' ? 0 : Math.max(0,billRemaining(b));
         const status = dsLabel[getDueStatus(b)] || b.status;
         rows.push([
-          t.name, t.unit, t.code,
-          b.label, b.amount, paid, Math.max(0,remaining), b.due||'', status, b.paidDate||'', b.remark||''
+          ...base,
+          b.label, b.amount, paid, remaining, b.due||'', status, b.paidDate||'', b.remark||''
         ]);
       });
     }
   });
-  const csv = rows.map(r=>r.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\n');
-  const blob = new Blob([csv], {type:'text/csv'});
+  const csv = rows.map(r=>r.map(csvCell).join(',')).join('\n');
+  // UTF-8 BOM so Excel renders ₱ and non-ASCII names correctly.
+  const blob = new Blob(['﻿'+csv], {type:'text/csv;charset=utf-8'});
   const url  = URL.createObjectURL(blob);
   const a    = document.createElement('a');
   a.href = url;
-  a.download = 'orange-apartment-'+new Date().toISOString().slice(0,10)+'.csv';
+  a.download = 'orange-apartment-'+todayISO()+'.csv';
   a.click();
   URL.revokeObjectURL(url);
   showToast('CSV exported ✓');
@@ -3034,8 +3825,37 @@ document.addEventListener('keydown', function(e) {
   if(_el('paiddate-modal')) { closePaidModal();    return; }
   if(_el('genbills-modal')) { closeGenModal();     return; }
   if(_el('payinst-modal'))  { closePayInstModal(); return; }
+  if(_el('announce-modal')) { closeAnnounceModal();return; }
+  if(_el('branding-modal')) { closeBrandingModal();return; }
   if(_el('stmt-modal'))     { closeStmtModal();    return; }
   if(_el('addbill-modal'))  { closeQuickBill();    return; }
   if(_el('tenant-modal'))   { closeModal();        return; }
+});
+
+// ─────────────────────────────────────────────
+// Focus trap: keep Tab inside the open dialog. The modals declare
+// aria-modal, but without this the background stayed keyboard-reachable —
+// Tab could land on (and activate) destructive controls behind the overlay.
+// ─────────────────────────────────────────────
+const _MODAL_IDS = ['paiddate-modal','genbills-modal','payinst-modal','announce-modal','branding-modal','stmt-modal','addbill-modal','tenant-modal'];
+document.addEventListener('keydown', function(e) {
+  if(e.key !== 'Tab') return;
+  let openEl = null;
+  for(const id of _MODAL_IDS){
+    const el = document.getElementById(id);
+    if(el && el.classList.contains('open')){ openEl = el; break; }
+  }
+  if(!openEl) return;
+  const focusables = Array.from(openEl.querySelectorAll(
+    'button, [href], input:not([type=hidden]), select, textarea, [tabindex]:not([tabindex="-1"])'
+  )).filter(el => !el.disabled && el.offsetParent !== null);
+  if(!focusables.length) return;
+  const first = focusables[0], last = focusables[focusables.length-1];
+  const active = document.activeElement;
+  if(e.shiftKey) {
+    if(active === first || !openEl.contains(active)) { e.preventDefault(); last.focus(); }
+  } else {
+    if(active === last || !openEl.contains(active)) { e.preventDefault(); first.focus(); }
+  }
 });
 
