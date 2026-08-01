@@ -697,6 +697,19 @@ const SORT_LABELS = {
   'urgency':      'Most urgent first'
 };
 
+// Card-view grouping. 'auto' keeps the historical behavior (floor headers
+// when floor labels exist and the list is unit-sorted). 'unit' groups the
+// tenants of one physical unit under a shared header with a combined
+// balance — the natural view when several per-head all-inclusive tenants
+// share a unit.
+let groupMode = 'auto'; // 'auto' | 'floor' | 'unit' | 'none'
+const GROUP_LABELS = {
+  auto:  'Auto',
+  floor: 'By floor',
+  unit:  'By unit',
+  none:  'No grouping'
+};
+
 function setLoading(on, msg='Loading…') {
   let el = document.getElementById('loading-overlay');
   if (!el) {
@@ -936,6 +949,7 @@ async function logout() {
   filterSearch   = '';
   _openPaid      = new Set();
   sortOrder      = 'unit-asc';
+  groupMode      = 'auto';
   viewMode       = 'card';
   tableSortCol   = 'due';
   tableSortDir   = 'asc';
@@ -1549,6 +1563,12 @@ function renderAdmin() {
         <div class="sort-popover" id="sort-popover">
           ${Object.entries(SORT_LABELS).map(([k,lbl])=>`<button class="sort-option${sortOrder===k?' active':''}" onclick="setSortOrder('${k}')">${lbl}</button>`).join('')}
         </div>
+      </div>
+      <div style="position:relative;display:inline-block;" id="group-popover-wrap">
+        <button class="sort-toolbar-btn${groupMode!=='auto'?' active':''}" onclick="toggleGroupPopover()" title="Group tenants under floor or unit headers with combined balances">&#9638; Group${groupMode!=='auto'?': '+(GROUP_LABELS[groupMode]||''):''}</button>
+        <div class="sort-popover" id="group-popover">
+          ${Object.entries(GROUP_LABELS).map(([k,lbl])=>`<button class="sort-option${groupMode===k?' active':''}" onclick="setGroupMode('${k}')">${lbl}</button>`).join('')}
+        </div>
       </div>`:''}
       ${renderFilterChips()}
     </div>
@@ -1922,34 +1942,56 @@ function renderRows() {
     </div>`;
   };
 
-  // ── Floor grouping — when tenants carry a floor/group label and the list is
-  // unit-sorted, render group headers with per-floor rollups (tenant count +
-  // real outstanding balance). Other sort orders (balance, urgency) stay flat:
-  // interleaving group headers into a balance-sorted list would be misleading.
+  // ── Grouping — render group headers with rollups (tenant count + real
+  // outstanding balance). Two dimensions:
+  //   floor: one header per floor/group label
+  //   unit:  one header per physical unit — the right view when several
+  //          per-head all-inclusive tenants share one unit
+  // 'auto' preserves the historical default: floor headers when floor labels
+  // exist AND the list is unit-sorted (interleaving group headers into a
+  // balance-sorted list would be misleading). Explicit modes always group.
   const _floorRank = s => /\bground\b|^g\/?f\b/i.test(s) ? 0 : unitRank(s);
-  const useFloors = (sortOrder==='unit-asc'||sortOrder==='unit-desc')
-    && filtered.some(t=>(t.floor||'').trim());
-  if(!useFloors){
+  let keyOf = null, labelOf = null, rankOf = null;
+  if(groupMode==='floor' ||
+     (groupMode==='auto' && (sortOrder==='unit-asc'||sortOrder==='unit-desc')
+       && filtered.some(t=>(t.floor||'').trim()))) {
+    keyOf   = t => (t.floor||'').trim();
+    labelOf = k => k ? esc(k) : 'Unassigned';
+    rankOf  = _floorRank;
+  } else if(groupMode==='unit') {
+    keyOf   = t => (t.unit||'').trim();
+    labelOf = k => k ? 'Unit '+esc(k) : 'No unit';
+    rankOf  = unitRank;
+  }
+  if(!keyOf){
     c.innerHTML = filtered.map(buildCard).join('');
     return;
   }
   const groupKeys = []; const groupMap = {};
   filtered.forEach(t=>{
-    const k = (t.floor||'').trim();
+    const k = keyOf(t);
     if(!(k in groupMap)){ groupMap[k]=[]; groupKeys.push(k); }
     groupMap[k].push(t);
   });
   groupKeys.sort((a,b)=>{
     if(!a) return 1; if(!b) return -1;           // unassigned tenants sink last
-    const r = _floorRank(a)-_floorRank(b);
+    const r = rankOf(a)-rankOf(b);
     return (sortOrder==='unit-desc' ? -r : r) || a.localeCompare(b);
   });
   c.innerHTML = groupKeys.map(k=>{
     const list = groupMap[k];
     // Rollup uses the ORIGINAL tenants so filters can't understate what's owed.
     const out = list.reduce((s,t)=>{ const orig=tenants.find(ot=>ot.id===t.id)||t; return s+tenantBalance(orig); },0);
-    const meta = `${list.length} tenant${list.length!==1?'s':''} &nbsp;·&nbsp; ${out?'&#8369;'+out.toLocaleString()+' outstanding':'settled'}`;
-    const head = `<div class="floor-group-head"><span class="floor-group-name">${k?esc(k):'Unassigned'}</span><span class="floor-group-meta">${meta}</span></div>`;
+    // For a unit whose tenants are all on the flat rate, say so in the header —
+    // it reads as "this unit is per-head all-inclusive" at a glance.
+    const allInclusive = groupMode==='unit' && list.length>0 && list.every(t=>{
+      const orig = tenants.find(ot=>ot.id===t.id)||t;
+      return orig.billing_model==='inclusive';
+    });
+    const meta = `${list.length} tenant${list.length!==1?'s':''}`
+      + (allInclusive?' &nbsp;·&nbsp; all-inclusive':'')
+      + ` &nbsp;·&nbsp; ${out?'&#8369;'+out.toLocaleString()+' outstanding':'settled'}`;
+    const head = `<div class="floor-group-head"><span class="floor-group-name">${labelOf(k)}</span><span class="floor-group-meta">${meta}</span></div>`;
     return head + list.map(buildCard).join('');
   }).join('');
 }
@@ -3574,13 +3616,29 @@ function closeFilterPopover() {
 function toggleSortPopover() {
   const el = document.getElementById('sort-popover');
   el.classList.toggle('open');
-  // Close filter popover
+  // Close the other popovers
   const fp = document.getElementById('filter-popover');
   if (fp) fp.classList.remove('open');
+  const gp = document.getElementById('group-popover');
+  if (gp) gp.classList.remove('open');
 }
 function setSortOrder(order) {
   sortOrder = order;
   document.getElementById('sort-popover').classList.remove('open');
+  rerenderAdmin();
+}
+function toggleGroupPopover() {
+  const el = document.getElementById('group-popover');
+  el.classList.toggle('open');
+  const fp = document.getElementById('filter-popover');
+  if (fp) fp.classList.remove('open');
+  const sp = document.getElementById('sort-popover');
+  if (sp) sp.classList.remove('open');
+}
+function setGroupMode(mode) {
+  groupMode = GROUP_LABELS[mode] ? mode : 'auto';
+  const gp = document.getElementById('group-popover');
+  if (gp) gp.classList.remove('open');
   rerenderAdmin();
 }
 function toggleFilterStatus(s) {
@@ -3627,6 +3685,11 @@ document.addEventListener('click', function(e) {
   if (spWrap && !spWrap.contains(e.target)) {
     const sp = document.getElementById('sort-popover');
     if (sp) sp.classList.remove('open');
+  }
+  const gpWrap = document.getElementById('group-popover-wrap');
+  if (gpWrap && !gpWrap.contains(e.target)) {
+    const gp = document.getElementById('group-popover');
+    if (gp) gp.classList.remove('open');
   }
 });
 
