@@ -3428,11 +3428,20 @@ async function saveNewTemplate() {
 
 // ─────────────────────────────────────────────
 // GENERATE BILLS MODAL
+// Built to scale: with a handful of tenants it looks like a simple list,
+// with dozens it becomes floor sections with check-all toggles under a
+// summary bar. Selection state lives in _genState (not DOM checkboxes) so
+// collapsing a section can't lose choices, and already-generated bills
+// compress to one note per tenant instead of a wall of disabled rows.
 // ─────────────────────────────────────────────
+let _genState = null;    // {yr, mo, useGroups, groups:[{key, entries:[{t, rows}]}]}
+let _genOpenGroups = {}; // group key -> bool; unset keys use the render default
+
 function openGenModal() {
   const now = new Date();
   const ym = now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0');
   document.getElementById('gen-month-input').value = ym;
+  _genOpenGroups = {};
   openModal('genbills-modal');
   refreshGenPreview();
 }
@@ -3445,60 +3454,178 @@ function refreshGenPreview() {
   const monthName = new Date(yr,mo-1,1).toLocaleString('default',{month:'long',year:'numeric'});
   document.getElementById('genbills-title').textContent = 'Generate Bills — '+monthName;
 
-  const groups = [];
+  const _normLabel = s => s.trim().toLowerCase();
+  const entries = [];
   tenants.forEach(t => {
     const tmpls = t.templates||[];
     if(!tmpls.length) return;
     const rows = tmpls.map(tmpl => {
-      // Check if a bill with the same label already exists with a due date in this month/year
-      const dueDay = Math.min(tmpl.dayOfMonth, new Date(yr, mo, 0).getDate()); // cap to last day of month
+      // Cap the due day to the last day of shorter months.
+      const dueDay = Math.min(tmpl.dayOfMonth, new Date(yr, mo, 0).getDate());
       const dueDate = `${yr}-${String(mo).padStart(2,'0')}-${String(dueDay).padStart(2,'0')}`;
-      const _normLabel = s => s.trim().toLowerCase();
       const alreadyExists = t.bills.some(b => _normLabel(b.label)===_normLabel(tmpl.label) && b.due && b.due.startsWith(`${yr}-${String(mo).padStart(2,'0')}`));
-      return {tmpl, dueDate, alreadyExists};
+      return {tmpl, dueDate, alreadyExists, selected: !alreadyExists};
     });
-    groups.push({t, rows});
+    entries.push({t, rows});
   });
 
-  if(!groups.length) {
+  if(!entries.length) {
+    _genState = null;
     document.getElementById('gen-preview-body').innerHTML = '<div class="gen-empty">No templates found. Open a tenant\'s edit modal and add templates first.</div>';
+    _genUpdateButton();
     return;
   }
 
-  document.getElementById('gen-preview-body').innerHTML = groups.map((g,gi) => `
-    <div class="gen-tenant-group">
-      <div class="gen-tenant-name">${esc(g.t.name)} &nbsp;·&nbsp; Unit ${esc(g.t.unit)}</div>
-      ${g.rows.map((r,ri) => `
-        <div class="gen-bill-row${r.alreadyExists?' skipped':''}">
-          <input type="checkbox" id="gen-cb-${gi}-${ri}" ${r.alreadyExists?'disabled':'checked'}>
-          <div class="gen-bill-info">
-            <div class="gen-bill-label">${esc(r.tmpl.label)}</div>
-            ${r.alreadyExists
-              ? `<div class="gen-bill-skip-note">⚠ Bill already exists this month — skipped</div>`
-              : `<div class="gen-bill-due">Due ${formatDate(r.dueDate)}</div>`
-            }
-          </div>
-          <div class="gen-bill-amount">${r.tmpl.pendingAmount ? '<span style="color:var(--orange);font-size:12px;font-weight:600;">Pending amount</span>' : '&#8369;'+Number(r.tmpl.amount).toLocaleString()}</div>
-        </div>`).join('')}
-    </div>`).join('');
+  const groupMap = {}; const groupOrder = [];
+  entries.forEach(e => {
+    const k = (e.t.floor||'').trim();
+    if(!(k in groupMap)){ groupMap[k]=[]; groupOrder.push(k); }
+    groupMap[k].push(e);
+  });
+  groupOrder.sort((a,b)=>{ if(!a) return 1; if(!b) return -1; return unitRank(a)-unitRank(b) || a.localeCompare(b); });
+  _genState = {
+    yr, mo,
+    useGroups: groupOrder.length > 1,
+    groups: groupOrder.map(k=>({key:k, entries:groupMap[k]}))
+  };
+  renderGenPreview();
+}
 
-  // Store the generation data for confirmGenerateBills
-  document.getElementById('genbills-modal')._genData = {groups, yr, mo};
+function _genAllRows() {
+  if(!_genState) return [];
+  const out = [];
+  _genState.groups.forEach(g=>g.entries.forEach(e=>e.rows.forEach(r=>out.push(r))));
+  return out;
+}
+// Totals over a set of rows: selected count, peso total, pending-amount
+// count (no peso value yet), and how many were skipped as already existing.
+function _genTotals(rows) {
+  let count=0, amount=0, pendingCount=0, skipped=0;
+  rows.forEach(r=>{
+    if(r.alreadyExists){ skipped++; return; }
+    if(!r.selected) return;
+    count++;
+    if(r.tmpl.pendingAmount) pendingCount++;
+    else amount += Number(r.tmpl.amount)||0;
+  });
+  return {count, amount, pendingCount, skipped};
+}
+function _genUpdateButton() {
+  const btn = document.getElementById('gen-confirm-btn');
+  if(!btn) return;
+  const tot = _genTotals(_genAllRows());
+  btn.disabled = !tot.count;
+  btn.textContent = tot.count ? 'Generate '+tot.count+' Bill'+(tot.count!==1?'s':'') : 'Nothing to Generate';
+}
+
+function renderGenPreview() {
+  if(!_genState) return;
+  const all = _genAllRows();
+  const tot = _genTotals(all);
+  const selectable = all.filter(r=>!r.alreadyExists).length;
+  // Small runs stay fully expanded; big runs start collapsed to their
+  // per-floor rollups so the admin reviews totals, not sixty rows.
+  const defaultOpen = !_genState.useGroups || selectable <= 10;
+
+  const summary = `<div class="gen-summary">
+    <div class="gen-summary-main"><strong>${tot.count} bill${tot.count!==1?'s':''}</strong> selected
+      &nbsp;·&nbsp; &#8369;${tot.amount.toLocaleString()}${tot.pendingCount?' + '+tot.pendingCount+' pending-amount':''}
+      ${tot.skipped?`&nbsp;·&nbsp; <span class="gen-summary-skip">${tot.skipped} already generated</span>`:''}
+    </div>
+    ${selectable?`<div class="gen-summary-actions">
+      <button class="gen-mini-btn" onclick="genSetAll(true)">Select all</button>
+      <button class="gen-mini-btn" onclick="genSetAll(false)">Clear</button>
+    </div>`:''}
+  </div>`;
+
+  const rowHtml = (r, gi, ei, ri) => r.alreadyExists ? '' : `
+    <div class="gen-bill-row">
+      <input type="checkbox" ${r.selected?'checked':''} onchange="genToggleRow(${gi},${ei},${ri},this.checked)" aria-label="Include ${esc(r.tmpl.label)}">
+      <div class="gen-bill-info">
+        <div class="gen-bill-label">${esc(r.tmpl.label)}</div>
+        <div class="gen-bill-due">Due ${formatDate(r.dueDate)}</div>
+      </div>
+      <div class="gen-bill-amount">${r.tmpl.pendingAmount ? '<span style="color:var(--orange);font-size:12px;font-weight:600;">Pending amount</span>' : '&#8369;'+Number(r.tmpl.amount).toLocaleString()}</div>
+    </div>`;
+
+  const tenantHtml = (e, gi, ei) => {
+    const skippedRows = e.rows.filter(r=>r.alreadyExists);
+    return `<div class="gen-tenant-group">
+      <div class="gen-tenant-name">${esc(e.t.name)} &nbsp;·&nbsp; Unit ${esc(e.t.unit)}</div>
+      ${e.rows.map((r,ri)=>rowHtml(r,gi,ei,ri)).join('')}
+      ${skippedRows.length?`<div class="gen-bill-skip-note">&#9888; Already generated this month: ${skippedRows.map(r=>esc(r.tmpl.label)).join(', ')}</div>`:''}
+    </div>`;
+  };
+
+  let body;
+  if(!_genState.useGroups) {
+    body = _genState.groups.map((g,gi)=>g.entries.map((e,ei)=>tenantHtml(e,gi,ei)).join('')).join('');
+  } else {
+    body = _genState.groups.map((g,gi)=>{
+      const rows = [];
+      g.entries.forEach(e=>e.rows.forEach(r=>rows.push(r)));
+      const gt = _genTotals(rows);
+      const gSelectable = rows.filter(r=>!r.alreadyExists);
+      const open = (g.key in _genOpenGroups) ? _genOpenGroups[g.key] : defaultOpen;
+      const allSel = gSelectable.length>0 && gSelectable.every(r=>r.selected);
+      const label = g.key ? esc(g.key) : 'No floor set';
+      const meta = gSelectable.length
+        ? `${gt.count}/${gSelectable.length} bill${gSelectable.length!==1?'s':''} &nbsp;·&nbsp; &#8369;${gt.amount.toLocaleString()}${gt.pendingCount?' +'+gt.pendingCount+' pending':''}`
+        : 'all generated &#10003;';
+      return `<div class="gen-group">
+        <div class="gen-group-head">
+          ${gSelectable.length?`<input type="checkbox" ${allSel?'checked':''} onchange="genToggleGroup(${gi},this.checked)" aria-label="Select all bills in ${label}">`:'<span class="gen-group-spacer"></span>'}
+          <button class="gen-group-title" onclick="genToggleOpen(${gi})" aria-expanded="${open?'true':'false'}">
+            <span class="insights-arrow${open?' open':''}">›</span> ${label}
+            <span class="gen-group-meta">${meta}</span>
+          </button>
+        </div>
+        ${open?`<div class="gen-group-body">${g.entries.map((e,ei)=>tenantHtml(e,gi,ei)).join('')}</div>`:''}
+      </div>`;
+    }).join('');
+  }
+
+  document.getElementById('gen-preview-body').innerHTML = summary + body;
+  _genUpdateButton();
+}
+
+function genToggleRow(gi, ei, ri, checked) {
+  const g = _genState && _genState.groups[gi];
+  const r = g && g.entries[ei] && g.entries[ei].rows[ri];
+  if(!r || r.alreadyExists) return;
+  r.selected = !!checked;
+  renderGenPreview();
+}
+function genToggleGroup(gi, checked) {
+  const g = _genState && _genState.groups[gi];
+  if(!g) return;
+  g.entries.forEach(e=>e.rows.forEach(r=>{ if(!r.alreadyExists) r.selected = !!checked; }));
+  renderGenPreview();
+}
+function genToggleOpen(gi) {
+  const g = _genState && _genState.groups[gi];
+  if(!g) return;
+  const selectable = _genAllRows().filter(r=>!r.alreadyExists).length;
+  const defaultOpen = !_genState.useGroups || selectable <= 10;
+  const cur = (g.key in _genOpenGroups) ? _genOpenGroups[g.key] : defaultOpen;
+  _genOpenGroups[g.key] = !cur;
+  renderGenPreview();
+}
+function genSetAll(sel) {
+  if(!_genState) return;
+  _genState.groups.forEach(g=>g.entries.forEach(e=>e.rows.forEach(r=>{ if(!r.alreadyExists) r.selected = !!sel; })));
+  renderGenPreview();
 }
 
 async function confirmGenerateBills() {
-  const modal = document.getElementById('genbills-modal');
-  const {groups} = modal._genData || {};
-  if(!groups) return;
+  if(!_genState){ showToast('No bills selected to generate.', false); return; }
 
   // Build candidate bill arrays WITHOUT mutating live tenant objects yet.
   const pending = []; // [{tenant, newBills}]
-  groups.forEach((g, gi) => {
+  _genState.groups.forEach(g => g.entries.forEach(e => {
     const additions = [];
-    g.rows.forEach((r, ri) => {
-      if(r.alreadyExists) return;
-      const cb = document.getElementById(`gen-cb-${gi}-${ri}`);
-      if(!cb || !cb.checked) return;
+    e.rows.forEach(r => {
+      if(r.alreadyExists || !r.selected) return;
       additions.push({
         label:    r.tmpl.label,
         amount:   r.tmpl.pendingAmount ? 0 : normalizeAmount(r.tmpl.amount),
@@ -3510,8 +3637,8 @@ async function confirmGenerateBills() {
         payments: []
       });
     });
-    if(additions.length) pending.push({tenant: g.t, newBills: [...g.t.bills, ...additions]});
-  });
+    if(additions.length) pending.push({tenant: e.t, newBills: [...e.t.bills, ...additions]});
+  }));
 
   if(!pending.length){ showToast('No bills selected to generate.', false); return; }
 
