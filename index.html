@@ -38,6 +38,10 @@
         <label for="admin-pw">Password</label>
         <input type="password" id="admin-pw" autocomplete="current-password" placeholder="Enter password" onkeydown="if(event.key==='Enter')adminLogin()">
       </div>
+      <div class="remember-row">
+        <input type="checkbox" id="admin-remember">
+        <label for="admin-remember">Keep me signed in on this device</label>
+      </div>
       <button class="btn-primary" onclick="adminLogin()">Enter Dashboard</button>
       <div style="text-align:center;margin-top:14px;">
         <button onclick="sendPasswordReset()" class="link-btn">Forgot password?</button>

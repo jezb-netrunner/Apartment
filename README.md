@@ -14,9 +14,15 @@ No build step, no framework: `index.html` + `app.js` + `app.css`, backed by
 - Monthly **bill templates** + one-click "Generate Bills" for the whole building.
 - **Expenses ledger** (electricity, water, maintenance…) with a monthly
   *collected − expenses = net* readout — the number that tells you whether an
-  all-inclusive rate is still profitable after utilities.
+  all-inclusive rate is still profitable after utilities. Electricity and
+  water expenses can carry the bill's kWh / m³ reading, so usage is tracked
+  alongside cost.
 - Floor/group labels with per-floor outstanding rollups.
-- Insights: billed vs collected, bill status, top outstanding, overdue aging, net position.
+- Insights: a **Key Findings** digest (collection pace, who to chase, habitual
+  late payers, utility cost spikes with usage-vs-rate attribution, what the
+  all-inclusive rates are absorbing), plus billed vs collected, utilities paid
+  vs billed back, payment behavior, top outstanding, overdue aging, and net
+  position.
 - Printable Statements of Account (customizable, live preview), payment
   reminders ready to paste into SMS/Messenger/Viber, CSV export.
 - Announcements board and payment instructions pushed to every tenant portal.
@@ -47,18 +53,24 @@ No build step, no framework: `index.html` + `app.js` + `app.css`, backed by
 2. Run `supabase-migration.sql` (RLS, tenant-login RPC, rate limiting).
 3. Run `supabase-migration-2.sql` (billing models, expenses table, floor labels,
    unique access codes, per-IP login throttling, optimistic concurrency).
-   Both files are idempotent — safe to re-run.
-4. Create the admin user under Supabase **Authentication → Users**.
-5. In `app.js`, set `SB_URL` and `SB_KEY` to your project's URL and publishable
+4. Run `supabase-migration-3.sql` (optional `units` column on expenses for
+   kWh / m³ usage tracking). All three files are idempotent — safe to re-run.
+5. Create the admin user under Supabase **Authentication → Users**.
+6. In `app.js`, set `SB_URL` and `SB_KEY` to your project's URL and publishable
    key; update the `connect-src` host in `index.html`'s CSP to match.
-6. Push to GitHub with Pages enabled — `.github/workflows/deploy.yml` deploys
+7. Push to GitHub with Pages enabled — `.github/workflows/deploy.yml` deploys
    on every push to `main` (SQL files are stripped from the published site).
-7. Sign in as admin → **Property → Edit** to set your building's name.
+8. Sign in as admin → **Property → Edit** to set your building's name.
 
 ## Security model
 
 - **Admin**: Supabase email auth (JWT). Row Level Security grants
   `authenticated` full CRUD on `tenants`, `settings`, `expenses`.
+  Sessions live in memory and end with the tab unless the admin ticks
+  **"Keep me signed in on this device"** at login — only then is the
+  Supabase session (refresh token included) persisted to that device's
+  localStorage. Signing out always clears it. Don't use the option on a
+  shared computer.
 - **Tenant**: an access code is exchanged for that tenant's row via the
   `login_tenant` RPC — the only anon path to tenant data. Failed attempts are
   rate-limited per code (5/15 min), per IP (20/15 min), and globally
@@ -77,8 +89,9 @@ No build step, no framework: `index.html` + `app.js` + `app.css`, backed by
 | File | Purpose |
 |---|---|
 | `index.html` | Markup: login, app shell, modals. CSP locked to self + Supabase. |
-| `app.js` | All logic (~3.3k lines, vanilla JS). |
+| `app.js` | All logic (~4.5k lines, vanilla JS). |
 | `app.css` | All styles, mobile-first responsive. |
 | `supabase-migration.sql` | v1 schema hardening: RLS, login RPC, rate limiting. |
 | `supabase-migration-2.sql` | v2: billing models, expenses, floors, concurrency. |
+| `supabase-migration-3.sql` | v3: optional kWh / m³ usage column on expenses. |
 | `vendor/` | Pinned supabase-js, served locally so the CSP stays `'self'`. |
