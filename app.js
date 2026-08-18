@@ -706,9 +706,6 @@ let editingId = null;
 let expenses = [];
 let expensesAvailable = true;
 let _expensesLoadError = false; // true = fetch failed for a non-schema reason
-// False when the expenses.units column is missing (migration 3 not run yet):
-// the usage field hides and utility insights fall back to cost-only trends.
-let _expenseUnitsAvailable = true;
 let _expensesOpen = false;
 let expenseMonth = '';      // '' = current month, else 'YYYY-MM'
 let _editingExpenseId = null;
@@ -909,14 +906,7 @@ async function showApp() {
       const [rows] = await Promise.all([
         dbGetAll(),
         loadAdminSettings(),
-        dbGetExpenses().then(x=>{
-            expenses = x||[];
-            expensesAvailable = true; _expensesLoadError = false;
-            // select=* returns every column, so any row tells us whether the
-            // units column (migration 3) exists. Zero rows: assume it does —
-            // the insert path downgrades gracefully if it turns out missing.
-            if(expenses.length) _expenseUnitsAvailable = ('units' in expenses[0]);
-          })
+        dbGetExpenses().then(x=>{ expenses = x||[]; expensesAvailable = true; _expensesLoadError = false; })
           .catch(e=>{
             expenses = [];
             // "Table missing" means migration 2 hasn't run — show setup help.
@@ -1029,7 +1019,6 @@ async function logout() {
   _portalSettingsPromise = null; // next tenant login refetches fresh settings
   expenses = [];
   expensesAvailable = true;
-  _expenseUnitsAvailable = true; // re-detected on next load (migration may have run since)
   _expensesOpen = false;
   expenseMonth = '';
   _editingExpenseId = null;
@@ -1110,8 +1099,8 @@ function toggleInsights() {
 // spikes, what the all-inclusive rates are absorbing). The cards below it
 // carry the evidence:
 //  1. 6-month line: ₱ billed vs ₱ collected per month
-//  2. Utilities & usage: electricity/water spend (+ kWh/m³ when recorded)
-//     vs what was billed back to itemized tenants
+//  2. Utilities: electricity/water spend vs what was billed back to
+//     itemized tenants
 //  3. Payment behavior: on-time rate and habitual late payers
 //  4. Top tenants bar: outstanding balance per tenant (top 6)
 //  5. Overdue aging buckets  6. Net position (collected − expenses)
@@ -1192,20 +1181,10 @@ function _utilityBilledInMonth(ym) {
   return out;
 }
 
-// Spend + recorded usage for one expense category in a month. `units` is
-// null when no row that month carries a reading (usage untracked ≠ zero);
-// `metered` is the spend covered by rows WITH readings, so effective rates
-// divide matching money by matching usage even in mixed months.
+// Spend for one expense category in a month.
 function _expenseCatInMonth(ym, cat) {
-  let amt = 0, units = 0, metered = 0, hasUnits = false;
-  expenses.forEach(x => {
-    if(x.category !== cat || !(x.expense_date||'').startsWith(ym)) return;
-    const a = Number(x.amount)||0;
-    amt += a;
-    const u = Number(x.units);
-    if(x.units != null && isFinite(u)) { units += u; metered += a; hasUnits = true; }
-  });
-  return { amt, units: hasUnits ? units : null, metered };
+  return expenses.reduce((s,x) =>
+    s + ((x.category === cat && (x.expense_date||'').startsWith(ym)) ? Number(x.amount)||0 : 0), 0);
 }
 
 function _inclusiveTenantCount() {
@@ -1353,35 +1332,20 @@ function _insightFindings(months) {
       tid: c.id });
   }
 
-  // 5. Utility cost spikes — usage-aware when kWh/m³ readings exist, so a
-  // spike can be blamed on consumption or on the provider's rate. The
-  // usage-vs-rate attribution only speaks when readings cover (nearly) all
-  // of the money on both sides — dividing a whole month's cost by a partial
-  // month's readings would pin the blame on the wrong culprit.
+  // 5. Utility cost spikes — a bill well above its own recent average is
+  // worth a look (usage jump, rate hike, a leak, or a billing error).
   if(expensesUsable) {
-    const fullyMetered = x => x.units != null && x.units > 0 && x.metered >= x.amt*0.95;
     [['electricity','Electricity'], ['water','Water']].forEach(([cat, label]) => {
-      const unit = _expUsageUnit(cat);
       const cur = _expenseCatInMonth(curYM, cat);
-      const prior = months.slice(0,-1).map(m => _expenseCatInMonth(m, cat)).filter(x => x.amt > 0);
-      if(cur.amt <= 0 || prior.length < 2) return;
-      const avg = prior.reduce((s,x) => s + x.amt, 0) / prior.length;
-      const ratio = cur.amt / avg;
-      const priorU = prior.filter(fullyMetered);
-      const uAvg = priorU.length >= 2 ? priorU.reduce((s,x) => s + x.units, 0) / priorU.length : null;
-      const uRatio = (fullyMetered(cur) && uAvg) ? cur.units / uAvg : null;
+      const prior = months.slice(0,-1).map(m => _expenseCatInMonth(m, cat)).filter(v => v > 0);
+      if(cur <= 0 || prior.length < 2) return;
+      const avg = prior.reduce((s,v) => s + v, 0) / prior.length;
+      const ratio = cur / avg;
       if(ratio >= 1.3) {
-        let why = '';
-        if(uRatio != null) {
-          const uMove = '('+Math.round(uAvg).toLocaleString()+'&rarr;'+Math.round(cur.units).toLocaleString()+' '+unit+')';
-          why = uRatio >= 1.2
-            ? ' Usage rose too '+uMove+' &mdash; consumption, not the rate.'
-            : ' Usage did not rise '+uMove+' &mdash; the price went up, not consumption.';
-        }
-        F.push({ tone:'warn', html: label+' spend this month ('+peso(cur.amt)+') is '
-          + Math.round((ratio-1)*100)+'% above its recent average ('+peso(avg)+').'+why });
+        F.push({ tone:'warn', html: label+' spend this month ('+peso(cur)+') is '
+          + Math.round((ratio-1)*100)+'% above its recent average ('+peso(avg)+') &mdash; worth checking the bill.' });
       } else if(ratio <= 0.7) {
-        F.push({ tone:'good', html: label+' spend this month ('+peso(cur.amt)+') is '
+        F.push({ tone:'good', html: label+' spend this month ('+peso(cur)+') is '
           + Math.round((1-ratio)*100)+'% below its recent average.' });
       }
     });
@@ -1397,7 +1361,7 @@ function _insightFindings(months) {
     const utilCats = ['electricity','water','internet'];
     let recYM = null, paid = 0;
     for(let i = months.length-1; i >= 0; i--) {
-      const p = utilCats.reduce((s,c) => s + _expenseCatInMonth(months[i], c).amt, 0);
+      const p = utilCats.reduce((s,c) => s + _expenseCatInMonth(months[i], c), 0);
       if(p > 0){ recYM = months[i]; paid = p; break; }
     }
     if(recYM) {
@@ -1492,10 +1456,9 @@ function renderInsights() {
       }).join('')
     + '</div>';
 
-  // ── 3. Utilities & usage ──
+  // ── 3. Utilities ──
   // What the building pays for electricity and water (from the expenses
-  // ledger), what got billed back to itemized tenants, and — when kWh/m³
-  // readings are recorded — actual consumption and the effective rate.
+  // ledger) charted against what got billed back to itemized tenants.
   let utilCardHtml = '';
   if(expensesAvailable) {
     const elec  = months.map(m => _expenseCatInMonth(m, 'electricity'));
@@ -1507,7 +1470,7 @@ function renderInsights() {
       const u = _utilityBilledInMonth(m);
       return u.electricity + u.water;
     });
-    const hasSpend = elec.some(x=>x.amt>0) || water.some(x=>x.amt>0);
+    const hasSpend = elec.some(v=>v>0) || water.some(v=>v>0);
     const hasAny = hasSpend || billedBack.some(v=>v>0);
     let utilBody;
     if(_expensesLoadError) {
@@ -1515,12 +1478,7 @@ function renderInsights() {
     } else if(!hasAny) {
       utilBody = '<div class="cg-bar-empty" style="color:var(--muted)">No utility spend recorded yet. Log electricity and water bills in the Expenses panel below &mdash; the category drives this chart.</div>';
     } else {
-      const rateStr = (amt, units, unit) => {
-        if(!units) return '';
-        const r = amt/units;
-        return ' &middot; &#8369;'+(r >= 100 ? Math.round(r).toLocaleString() : r.toFixed(2))+'/'+unit;
-      };
-      const uMax = Math.max(1, ...elec.map(x=>x.amt), ...water.map(x=>x.amt), ...billedBack);
+      const uMax = Math.max(1, ...elec, ...water, ...billedBack);
       const UW = 560, UH = 170, UPL = 36, UPR = 12, UPT = 16, UPB = 28;
       const uInnerW = UW-UPL-UPR, uInnerH = UH-UPT-UPB;
       const slotW = uInnerW / months.length;
@@ -1543,12 +1501,10 @@ function renderInsights() {
           return '<rect x="'+x.toFixed(1)+'" y="'+y.toFixed(1)+'" width="'+barW.toFixed(1)
             + '" height="'+(UPT+uInnerH-y).toFixed(1)+'" rx="2" class="'+cls+'"><title>'+title+'</title></rect>';
         };
-        parts.push(bar(cx-barW-1, elec[i].amt, 'cg-ubar-elec',
-          'Electricity '+mLbl+': ₱'+elec[i].amt.toLocaleString()
-          + (elec[i].units ? ' · '+elec[i].units.toLocaleString()+' kWh ('+'₱'+(elec[i].metered/elec[i].units).toFixed(2)+'/kWh)' : '')));
-        parts.push(bar(cx+1, water[i].amt, 'cg-ubar-water',
-          'Water '+mLbl+': ₱'+water[i].amt.toLocaleString()
-          + (water[i].units ? ' · '+water[i].units.toLocaleString()+' m³ ('+'₱'+(water[i].metered/water[i].units).toFixed(2)+'/m³)' : '')));
+        parts.push(bar(cx-barW-1, elec[i], 'cg-ubar-elec',
+          'Electricity '+mLbl+': ₱'+elec[i].toLocaleString()));
+        parts.push(bar(cx+1, water[i], 'cg-ubar-water',
+          'Water '+mLbl+': ₱'+water[i].toLocaleString()));
         if(billedBack[i] > 0) {
           const y = uYAt(billedBack[i]).toFixed(1);
           parts.push('<line x1="'+(cx-slotW*0.34).toFixed(1)+'" y1="'+y+'" x2="'+(cx+slotW*0.34).toFixed(1)+'" y2="'+y
@@ -1561,30 +1517,24 @@ function renderInsights() {
         + uGrid + uBars + '</svg>';
       // Latest month with utility spend → the summary rows under the chart.
       let li = -1;
-      for(let i = months.length-1; i >= 0; i--) { if(elec[i].amt>0 || water[i].amt>0){ li = i; break; } }
+      for(let i = months.length-1; i >= 0; i--) { if(elec[i]>0 || water[i]>0){ li = i; break; } }
       let uRows = '';
       if(li >= 0) {
         const lMon = new Date(months[li]+'-02').toLocaleString('default',{month:'long'});
-        const row = (dotCls, label, x, unit) => x.amt>0
+        const row = (dotCls, label, v) => v>0
           ? '<div class="uu-row"><span class="cg-legend-dot '+dotCls+'"></span><span class="uu-row-label">'+label+'</span>'
-            + '<span class="uu-row-val">&#8369;'+x.amt.toLocaleString()
-            + (x.units ? ' &middot; '+x.units.toLocaleString()+' '+unit+rateStr(x.metered, x.units, unit) : '')+'</span></div>'
+            + '<span class="uu-row-val">&#8369;'+v.toLocaleString()+'</span></div>'
           : '';
         uRows = '<div class="uu-rows"><div class="uu-rows-label">'+lMon+'</div>'
-          + row('uu-dot-elec', 'Electricity', elec[li], 'kWh')
-          + row('uu-dot-water', 'Water', water[li], 'm³')
-          + (billedBack[li] > 0 ? '<div class="uu-row"><span class="cg-legend-dot uu-dot-billed"></span><span class="uu-row-label">Billed to tenants</span><span class="uu-row-val">&#8369;'+billedBack[li].toLocaleString()+'</span></div>' : '')
+          + row('uu-dot-elec', 'Electricity', elec[li])
+          + row('uu-dot-water', 'Water', water[li])
+          + row('uu-dot-billed', 'Billed to tenants', billedBack[li])
           + '</div>';
       }
       const nInc = _inclusiveTenantCount();
-      const noteBits = [];
-      noteBits.push(nInc
+      const note = nInc
         ? nInc+' of '+tenants.length+' tenant'+(tenants.length!==1?'s':'')+' '+(nInc===1?'is':'are')+' all-inclusive: their utilities are never billed back &mdash; that share stays in these bars as a building expense the flat rate must cover.'
-        : 'Spend without a matching recharge (the green marks) is shouldered by the building.');
-      if(!_expenseUnitsAvailable)
-        noteBits.push('Run <strong>supabase-migration-3.sql</strong> to record kWh / m&sup3; readings and separate usage growth from rate hikes.');
-      else if(hasSpend && elec.concat(water).every(x => x.units == null))
-        noteBits.push('Tip: add the kWh / m&sup3; reading when logging electricity and water bills to track real usage, not just cost.');
+        : 'Spend without a matching recharge (the green marks) is shouldered by the building.';
       utilBody = utilSvg
         + '<div class="cg-legend cg-legend-line">'
         +   '<span class="cg-legend-item"><span class="cg-legend-dot uu-dot-elec"></span>Electricity</span>'
@@ -1592,10 +1542,10 @@ function renderInsights() {
         +   '<span class="cg-legend-item"><span class="uu-billed-swatch"></span>Billed to tenants</span>'
         + '</div>'
         + uRows
-        + '<div class="uu-note">'+noteBits.join('<br>')+'</div>';
+        + '<div class="uu-note">'+note+'</div>';
     }
     utilCardHtml = '<div class="insights-card insights-card-utils">'
-      + '<div class="insights-card-title">Utilities &amp; Usage <span class="insights-card-sub">paid vs billed back &middot; last 6 months</span></div>'
+      + '<div class="insights-card-title">Utilities <span class="insights-card-sub">paid vs billed back &middot; last 6 months</span></div>'
       + utilBody
       + '</div>';
   }
@@ -1768,24 +1718,6 @@ const EXPENSE_CATEGORIES = [
 ];
 const _expCatLabel = k => (EXPENSE_CATEGORIES.find(c=>c.key===k)||{label:k||'Other'}).label;
 
-// Categories whose bills state consumption: record it (optional) so usage
-// trends and effective rates (₱/kWh, ₱/m³) can be derived, not guessed.
-const EXPENSE_USAGE_UNITS = { electricity:'kWh', water:'m³' };
-const _expUsageUnit = cat => EXPENSE_USAGE_UNITS[cat] || '';
-
-// Show the usage field only for metered categories, and relabel it to match.
-function onExpenseCatChange(idSuffix) {
-  const catEl = document.getElementById('exp-cat-'+idSuffix);
-  const wrap  = document.getElementById('exp-units-wrap-'+idSuffix);
-  if(!catEl || !wrap) return;
-  const unit = _expUsageUnit(catEl.value);
-  wrap.style.display = unit ? '' : 'none';
-  const grid = catEl.closest('.exp-form-grid');
-  if(grid) grid.classList.toggle('has-units', !!unit);
-  const lbl = document.getElementById('exp-units-label-'+idSuffix);
-  if(lbl) lbl.textContent = 'Usage ('+unit+')';
-}
-
 function _expYM(){ return expenseMonth || _currentYM(); }
 function _expensesInMonth(ym) {
   return expenses.reduce((s,x)=>s+((x.expense_date||'').startsWith(ym)?Number(x.amount)||0:0),0);
@@ -1795,19 +1727,13 @@ function setExpenseMonth(v){ expenseMonth = v||''; _editingExpenseId = null; rer
 
 function _expFormHtml(idSuffix, x) {
   const today = todayISO();
-  const cat = x ? (x.category||'other') : EXPENSE_CATEGORIES[0].key;
-  const unit = _expenseUnitsAvailable ? _expUsageUnit(cat) : '';
-  const unitsField = _expenseUnitsAvailable
-    ? `<div class="field" id="exp-units-wrap-${idSuffix}"${unit?'':' style="display:none"'}><label for="exp-units-${idSuffix}"><span id="exp-units-label-${idSuffix}">Usage (${unit||'kWh'})</span> <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted)">(optional)</span></label><input type="text" id="exp-units-${idSuffix}" inputmode="decimal" autocomplete="off" placeholder="e.g. 350" value="${x&&x.units!=null?x.units:''}"></div>`
-    : '';
   return `<div class="exp-form">
-    <div class="exp-form-grid${unit?' has-units':''}">
+    <div class="exp-form-grid">
       <div class="field"><label for="exp-date-${idSuffix}">Date</label><input type="date" id="exp-date-${idSuffix}" value="${esc(x?x.expense_date:today)}"></div>
       <div class="field"><label for="exp-cat-${idSuffix}">Category</label>
-        <select id="exp-cat-${idSuffix}" onchange="onExpenseCatChange('${idSuffix}')">${EXPENSE_CATEGORIES.map(c=>`<option value="${c.key}"${cat===c.key?' selected':''}>${c.label}</option>`).join('')}</select>
+        <select id="exp-cat-${idSuffix}">${EXPENSE_CATEGORIES.map(c=>`<option value="${c.key}"${x&&x.category===c.key?' selected':''}>${c.label}</option>`).join('')}</select>
       </div>
       <div class="field"><label for="exp-amount-${idSuffix}">Amount (&#8369;)</label><input type="text" id="exp-amount-${idSuffix}" inputmode="decimal" autocomplete="off" placeholder="0" value="${x?x.amount:''}"></div>
-      ${unitsField}
       <div class="field exp-note-field"><label for="exp-note-${idSuffix}">Note <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted)">(optional)</span></label><input type="text" id="exp-note-${idSuffix}" maxlength="200" placeholder="e.g. BENECO bill for July" value="${esc(x?x.note||'':'')}"></div>
     </div>
     <div class="exp-form-actions">
@@ -1849,7 +1775,7 @@ function renderExpensesPanel() {
           : `<div class="exp-row">
               <span class="exp-date">${shortDate(x.expense_date)}</span>
               <span class="exp-cat exp-cat-${esc(x.category||'other')}">${esc(_expCatLabel(x.category))}</span>
-              <span class="exp-note">${x.units!=null&&_expUsageUnit(x.category)?`<span class="exp-units">${Number(x.units).toLocaleString()} ${_expUsageUnit(x.category)}</span>`:''}${esc(x.note||'')}</span>
+              <span class="exp-note">${esc(x.note||'')}</span>
               <span class="exp-amt">&#8369;${(Number(x.amount)||0).toLocaleString()}</span>
               <span class="exp-actions">
                 <button class="btn-icon" onclick="editExpense('${esc(x.id)}')" aria-label="Edit">&#9998;</button>
@@ -1880,28 +1806,6 @@ function renderExpensesPanel() {
   </div>`;
 }
 
-// Reads the optional usage input for metered categories. Returns null when
-// blank/hidden/not applicable, a number when valid, undefined on bad input.
-function _readExpenseUnits(idSuffix, category) {
-  if(!_expenseUnitsAvailable || !_expUsageUnit(category)) return null;
-  const el = document.getElementById('exp-units-'+idSuffix);
-  const raw = el ? String(el.value).trim() : '';
-  if(!raw) return null;
-  const n = Number(raw.replace(/,/g,''));
-  if(!isFinite(n) || n < 0) return undefined; // "35o" must not save as 0
-  return n;
-}
-// True when the write failed because migration 3 hasn't been run: flip the
-// feature off so the caller can retry the same write without the units
-// column (and say so instead of a plain success toast).
-const EXPENSE_UNITS_NOTE = 'Saved without usage — run supabase-migration-3.sql to record kWh/m³.';
-function _expenseUnitsColumnMissing(e) {
-  if(!/units/i.test(e.message||'')) return false;
-  if(!/column|schema cache/i.test(e.message||'')) return false;
-  _expenseUnitsAvailable = false;
-  return true;
-}
-
 let _expenseSaving = false;
 async function addExpense() {
   if(_expenseSaving) return; // double-click inserts duplicate rows otherwise
@@ -1912,26 +1816,14 @@ async function addExpense() {
   if(!date){ showToast('Please pick the expense date.', false); return; }
   const amount = normalizeAmount(rawAmt);
   if(!amount || amount<=0){ showToast('Please enter a valid amount.', false); return; }
-  const units = _readExpenseUnits('new', category);
-  if(units === undefined){ showToast('Usage must be a non-negative number (leave it blank to skip).', false); return; }
   const rec = { id: uid(), expense_date: date, category, amount, note };
-  if(_expenseUnitsAvailable) rec.units = units;
   _expenseSaving = true;
   try {
-    let unitsDropped = false;
-    try {
-      await dbInsertExpense(rec);
-    } catch(e) {
-      if(!_expenseUnitsColumnMissing(e)) throw e;
-      delete rec.units;
-      unitsDropped = units != null;
-      await dbInsertExpense(rec);
-    }
+    await dbInsertExpense(rec);
     expenses.push(rec);
     // Jump the panel to the month the expense was filed under so it's visible.
     expenseMonth = date.slice(0,7)===_currentYM() ? '' : date.slice(0,7);
-    // The save DID succeed — the units note is a caveat, not a failure.
-    showToast(unitsDropped ? EXPENSE_UNITS_NOTE : 'Expense recorded.');
+    showToast('Expense recorded.');
     rerenderAdmin();
   } catch(e) {
     if(/relation .*expenses|expenses.*does not exist|Could not find the table/i.test(e.message||'')) { expensesAvailable=false; rerenderAdmin(); }
@@ -1948,23 +1840,12 @@ async function saveExpenseEdit(id) {
   const note = document.getElementById('exp-note-edit').value.trim();
   if(!date){ showToast('Please pick the expense date.', false); return; }
   if(!amount || amount<=0){ showToast('Please enter a valid amount.', false); return; }
-  const units = _readExpenseUnits('edit', category);
-  if(units === undefined){ showToast('Usage must be a non-negative number (leave it blank to skip).', false); return; }
   const patch = { expense_date: date, category, amount, note };
-  if(_expenseUnitsAvailable) patch.units = units;
   try {
-    let unitsDropped = false;
-    try {
-      await dbUpdateExpense(id, patch);
-    } catch(e) {
-      if(!_expenseUnitsColumnMissing(e)) throw e;
-      delete patch.units;
-      unitsDropped = units != null;
-      await dbUpdateExpense(id, patch);
-    }
+    await dbUpdateExpense(id, patch);
     Object.assign(x, patch);
     _editingExpenseId = null;
-    showToast(unitsDropped ? EXPENSE_UNITS_NOTE : 'Expense updated.');
+    showToast('Expense updated.');
     rerenderAdmin();
   } catch(e) { showToast('Save failed: '+e.message, false); }
 }
@@ -1980,10 +1861,9 @@ async function deleteExpense(id) {
 }
 function exportExpensesCSV() {
   if(!expenses.length){ showToast('No expenses to export yet.', false); return; }
-  const rows = [['Date','Category','Amount','Usage','Unit','Note']];
+  const rows = [['Date','Category','Amount','Note']];
   expenses.slice().sort((a,b)=>(a.expense_date||'').localeCompare(b.expense_date||''))
-    .forEach(x=>rows.push([x.expense_date||'', _expCatLabel(x.category), x.amount,
-      x.units!=null?x.units:'', x.units!=null?_expUsageUnit(x.category):'', x.note||'']));
+    .forEach(x=>rows.push([x.expense_date||'', _expCatLabel(x.category), x.amount, x.note||'']));
   const csv = rows.map(r=>r.map(csvCell).join(',')).join('\n');
   const blob = new Blob(['﻿'+csv], {type:'text/csv;charset=utf-8'});
   const url  = URL.createObjectURL(blob);

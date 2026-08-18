@@ -1748,19 +1748,11 @@ main { flex: 1; padding: 52px 40px; max-width: 1120px; margin: 0 auto; width: 10
 .exp-form-grid {
   display: grid; grid-template-columns: 150px 160px 130px 1fr; gap: 10px; align-items: end;
 }
-/* Metered categories (electricity/water) show an extra optional Usage field.
-   Five fixed tracks don't fit the 769–900px band (the page keeps its desktop
-   padding there), so the has-units grid collapses earlier than the base one. */
-.exp-form-grid.has-units { grid-template-columns: 150px 160px 130px 120px 1fr; }
-@media (max-width: 900px) {
-  .exp-form-grid.has-units { grid-template-columns: 1fr 1fr; }
-  .exp-form-grid.has-units .exp-note-field { grid-column: 1/-1; }
-}
 .exp-form-grid .field { margin-bottom: 0; }
 .exp-form-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
 .exp-form-actions .btn-save, .exp-form-actions .btn-cancel { padding: 8px 18px; }
 @media (max-width: 768px) {
-  .exp-form-grid, .exp-form-grid.has-units { grid-template-columns: 1fr 1fr; }
+  .exp-form-grid { grid-template-columns: 1fr 1fr; }
   .exp-form-grid .exp-note-field { grid-column: 1/-1; }
 }
 .exp-list {
@@ -1786,12 +1778,6 @@ main { flex: 1; padding: 52px 40px; max-width: 1120px; margin: 0 auto; width: 10
 .exp-cat-maintenance { background: #f0fdf4; color: #166534; border-color: #bbf7d0; }
 .exp-cat-taxes       { background: #fefce8; color: #854d0e; border-color: #fde68a; }
 .exp-note { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.exp-units {
-  display: inline-block; margin-right: 8px; padding: 1px 8px;
-  border-radius: 20px; background: var(--bg); border: 1px solid var(--border);
-  font-size: 10.5px; font-weight: 600; color: var(--navy);
-  font-variant-numeric: tabular-nums; white-space: nowrap;
-}
 .exp-amt {
   font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums; white-space: nowrap;
 }
