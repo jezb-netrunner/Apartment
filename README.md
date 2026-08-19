@@ -16,7 +16,10 @@ No build step, no framework: `index.html` + `app.js` + `app.css`, backed by
   *collected − expenses = net* readout — the number that tells you whether an
   all-inclusive rate is still profitable after utilities.
 - Floor/group labels with per-floor outstanding rollups.
-- Insights: billed vs collected, bill status, top outstanding, overdue aging, net position.
+- Insights: a **Key Findings** digest (collection pace, who to chase, habitual
+  late payers, utility cost spikes, what the all-inclusive rates are
+  absorbing), plus billed vs collected, utilities paid vs billed back,
+  payment behavior, top outstanding, overdue aging, and net position.
 - Printable Statements of Account (customizable, live preview), payment
   reminders ready to paste into SMS/Messenger/Viber, CSV export.
 - Announcements board and payment instructions pushed to every tenant portal.
@@ -59,6 +62,11 @@ No build step, no framework: `index.html` + `app.js` + `app.css`, backed by
 
 - **Admin**: Supabase email auth (JWT). Row Level Security grants
   `authenticated` full CRUD on `tenants`, `settings`, `expenses`.
+  Sessions live in memory and end with the tab unless the admin ticks
+  **"Keep me signed in on this device"** at login — only then is the
+  Supabase session (refresh token included) persisted to that device's
+  localStorage. Signing out always clears it. Don't use the option on a
+  shared computer.
 - **Tenant**: an access code is exchanged for that tenant's row via the
   `login_tenant` RPC — the only anon path to tenant data. Failed attempts are
   rate-limited per code (5/15 min), per IP (20/15 min), and globally
@@ -77,7 +85,7 @@ No build step, no framework: `index.html` + `app.js` + `app.css`, backed by
 | File | Purpose |
 |---|---|
 | `index.html` | Markup: login, app shell, modals. CSP locked to self + Supabase. |
-| `app.js` | All logic (~3.3k lines, vanilla JS). |
+| `app.js` | All logic (~4.5k lines, vanilla JS). |
 | `app.css` | All styles, mobile-first responsive. |
 | `supabase-migration.sql` | v1 schema hardening: RLS, login RPC, rate limiting. |
 | `supabase-migration-2.sql` | v2: billing models, expenses, floors, concurrency. |

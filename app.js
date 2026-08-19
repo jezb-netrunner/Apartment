@@ -498,11 +498,54 @@ function expandAdminPaid(tid) {
 // ── SUPABASE CONFIG ──
 const SB_URL = 'https://bxzfqjspoyvwosmpgeof.supabase.co';
 const SB_KEY = 'sb_publishable_FgSrHN3LoB9XQ4ZQHCeoQQ_AXg54YkP';
+
+// Admin "keep me signed in": the session (refresh token included) lands in
+// localStorage ONLY when the admin ticks the box — the flag below gates every
+// write. Unticked, sessions live in memory and die with the tab, exactly like
+// the old persistSession:false behavior. The flag is read on every storage
+// call (not captured at client creation) so login can flip it just in time.
+const ADMIN_REMEMBER_KEY = 'oa_admin_remember';
+const ADMIN_SESSION_KEY  = 'oa_admin_session'; // storageKey below + supabase-js suffixes
+function _adminRememberOn() {
+  try { return localStorage.getItem(ADMIN_REMEMBER_KEY) === '1'; } catch { return false; }
+}
+const _memAuthStore = {};
+const _authStorage = {
+  getItem(k) {
+    if(_adminRememberOn()) {
+      try { const v = localStorage.getItem(k); if(v != null) return v; } catch {}
+    }
+    return (k in _memAuthStore) ? _memAuthStore[k] : null;
+  },
+  setItem(k, v) {
+    _memAuthStore[k] = v;
+    if(_adminRememberOn()) { try { localStorage.setItem(k, v); } catch {} }
+  },
+  removeItem(k) {
+    delete _memAuthStore[k];
+    try { localStorage.removeItem(k); } catch {}
+  }
+};
+// Drop the remembered-session opt-in AND any session already persisted under
+// it. supabase-js suffixes its storageKey, so sweep matching keys.
+function _forgetPersistedAdminSession() {
+  try {
+    localStorage.removeItem(ADMIN_REMEMBER_KEY);
+    for(let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if(k && k.startsWith(ADMIN_SESSION_KEY)) localStorage.removeItem(k);
+    }
+  } catch {}
+}
+
 const _sbClient = supabase.createClient(SB_URL, SB_KEY, {
   auth: {
-    persistSession: false,
-    // Keep the admin session alive for the life of the tab. Nothing is
-    // persisted to storage (persistSession stays false); without this the
+    // Sessions always persist to _authStorage; whether that reaches
+    // localStorage (survives the tab) is gated by the remember-me flag above.
+    persistSession: true,
+    storage: _authStorage,
+    storageKey: ADMIN_SESSION_KEY,
+    // Keep the admin session alive for the life of the tab. Without this the
     // JWT expired after ~an hour and writes silently fell back to the anon
     // key — RLS filtered them to zero rows and the UI showed success.
     autoRefreshToken: true,
@@ -775,10 +818,20 @@ async function adminLogin() {
   const email    = document.getElementById('admin-email').value.trim();
   const password = document.getElementById('admin-pw').value;
   if(!email||!password){ document.getElementById('login-error').textContent='Please enter your email and password.'; return; }
+  const rememberEl = document.getElementById('admin-remember');
+  const remember = !!(rememberEl && rememberEl.checked);
+  // The flag must be set BEFORE sign-in so the session write it triggers is
+  // persisted; an unticked box also clears any session remembered previously.
+  if(remember) { try { localStorage.setItem(ADMIN_REMEMBER_KEY, '1'); } catch {} }
+  else _forgetPersistedAdminSession();
   setLoading(true, 'Signing in…');
   const { data, error } = await _sbClient.auth.signInWithPassword({ email, password });
   setLoading(false);
-  if(error){ document.getElementById('login-error').textContent = 'Incorrect email or password.'; return; }
+  if(error){
+    if(remember) _forgetPersistedAdminSession(); // don't leave a dangling opt-in
+    document.getElementById('login-error').textContent = 'Incorrect email or password.';
+    return;
+  }
   currentUser = 'admin';
   showApp();
 }
@@ -879,8 +932,9 @@ async function showApp() {
   }
 }
 
-// Silent login from a ?code=XXXX portal link or a remembered device code.
-// Runs once on page load; any failure falls back to the normal login screen.
+// Silent login from a ?code=XXXX portal link, a remembered admin session, or
+// a remembered tenant code. Runs once on page load; any failure falls back to
+// the normal login screen.
 async function tryAutoLogin() {
   if(window.location.hash) return; // password-recovery flow owns the URL hash
   let code = '';
@@ -891,9 +945,34 @@ async function tryAutoLogin() {
   } catch {}
   if(code) {
     fromLink = true;
-    // Strip the code from the address bar so it isn't left in plain sight.
+    // Strip the code from the address bar FIRST — every path below (tenant
+    // login, admin auto-login, plain login screen) must leave no access code
+    // in plain sight or in browser history.
     history.replaceState(null, '', window.location.pathname);
-  } else {
+  }
+  // Admin "keep me signed in": a persisted session logs straight in — unless
+  // an explicit portal link was opened. Explicit intent wins over ambient
+  // state: an admin testing a tenant's link expects the tenant portal, and a
+  // tenant handed a link on a shared device must not land in the dashboard.
+  if(!fromLink && _adminRememberOn()) {
+    setLoading(true, 'Signing you in…');
+    try {
+      // getSession refreshes an expired JWT via the stored refresh token.
+      const { data: { session } } = await _sbClient.auth.getSession();
+      if(session) {
+        currentUser = 'admin';
+        setLoading(false);
+        showApp();
+        return;
+      }
+    } catch {}
+    setLoading(false);
+    // No usable session (revoked, or refresh failed offline): fall through to
+    // the login screen with the box pre-ticked to match the saved preference.
+    const rememberEl = document.getElementById('admin-remember');
+    if(rememberEl) rememberEl.checked = true;
+  }
+  if(!code) {
     try { code = (localStorage.getItem(PORTAL_CODE_KEY)||'').trim().toUpperCase(); } catch {}
   }
   if(!code) return;
@@ -925,7 +1004,11 @@ async function tryAutoLogin() {
   setLoading(false);
 }
 async function logout() {
-  if(currentUser==='admin') await _sbClient.auth.signOut();
+  if(currentUser==='admin') {
+    // Explicit sign-out always forgets the device, opt-in or not.
+    _forgetPersistedAdminSession();
+    try { await _sbClient.auth.signOut(); } catch {}
+  }
   else { try { localStorage.removeItem(PORTAL_CODE_KEY); } catch {} }
   // Reset every piece of session state so a subsequent login starts clean.
   currentUser = null;
@@ -958,6 +1041,8 @@ async function logout() {
   document.getElementById('app').style.display='none';
   document.getElementById('admin-email').value='';
   document.getElementById('admin-pw').value='';
+  const _adminRememberEl = document.getElementById('admin-remember');
+  if(_adminRememberEl) _adminRememberEl.checked = false;
   document.getElementById('tenant-code').value='';
   document.getElementById('login-error').textContent='';
   document.getElementById('main-content').innerHTML='';
@@ -1009,10 +1094,16 @@ function toggleInsights() {
   _insightsOpen = !_insightsOpen;
   rerenderAdmin();
 }
-// Three small SVG charts:
+// The panel leads with Key Findings — computed, plain-language sentences
+// about what changed and what to do (collection pace, who to chase, utility
+// spikes, what the all-inclusive rates are absorbing). The cards below it
+// carry the evidence:
 //  1. 6-month line: ₱ billed vs ₱ collected per month
-//  2. Status donut: count of bills by current due-status
-//  3. Top tenants bar: outstanding balance per tenant (top 6)
+//  2. Utilities: electricity/water spend vs what was billed back to
+//     itemized tenants
+//  3. Payment behavior: on-time rate and habitual late payers
+//  4. Top tenants bar: outstanding balance per tenant (top 6)
+//  5. Overdue aging buckets  6. Net position (collected − expenses)
 // ─────────────────────────────────────────────
 function _ymKey(d) {
   return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0');
@@ -1054,6 +1145,258 @@ function _billedInMonth(ym) {
   }));
   return total;
 }
+// Unpaid remainder on bills DUE in a month — "how much of that month's
+// billing is still out there", regardless of when partial payments landed.
+function _outstandingForMonth(ym) {
+  let total = 0, count = 0;
+  tenants.forEach(t => (t.bills||[]).forEach(b => {
+    if(b.status==='paid' || !(b.due||'').startsWith(ym)) return;
+    const rem = Math.max(0, billRemaining(b));
+    if(rem > 0){ total += rem; count++; }
+  }));
+  return { total, count };
+}
+
+// Utility sub-kind from the bill label — a finer split of billCategory's
+// 'utilities' bucket, so recharges can be compared against the matching
+// expense category rather than lumped into one incomparable total.
+function billUtilityKind(b) {
+  const l = (b.label||'').toLowerCase();
+  if(/electric|kuryente|power|beneco|meralco/.test(l)) return 'electricity';
+  if(/water|tubig/.test(l)) return 'water';
+  if(/internet|wi-?fi|cable/.test(l)) return 'internet';
+  return 'other';
+}
+
+// Utilities billed to tenants in a month (itemized recharge line items), by kind.
+function _utilityBilledInMonth(ym) {
+  const out = { electricity:0, water:0, internet:0, other:0, total:0 };
+  tenants.forEach(t => (t.bills||[]).forEach(b => {
+    if(!(b.due && b.due.startsWith(ym))) return;
+    if(billCategory(b) !== 'utilities') return;
+    const amt = Number(b.amount)||0;
+    out[billUtilityKind(b)] += amt;
+    out.total += amt;
+  }));
+  return out;
+}
+
+// Spend for one expense category in a month.
+function _expenseCatInMonth(ym, cat) {
+  return expenses.reduce((s,x) =>
+    s + ((x.category === cat && (x.expense_date||'').startsWith(ym)) ? Number(x.amount)||0 : 0), 0);
+}
+
+function _inclusiveTenantCount() {
+  return tenants.filter(t => t.billing_model === 'inclusive').length;
+}
+
+// Punctuality of paid bills DUE in the given window (list of ascending
+// 'YYYY-MM' keys): who pays on time, who runs late, and by how many days.
+// Windowing on the DUE date keeps a back-rent settlement from years ago
+// from reading as "900 days late" and drowning everyone else's bars; a
+// paid date in the future is a date-picker typo and is skipped.
+function _paymentBehavior(months) {
+  const since = months[0];
+  const today = todayISO();
+  const byTenant = new Map();
+  let onTime = 0, late = 0;
+  tenants.forEach(t => (t.bills||[]).forEach(b => {
+    if(b.status !== 'paid' || !b.due || !b.paidDate) return;
+    if(b.due.slice(0,7) < since) return;
+    const pd = String(b.paidDate).slice(0,10);
+    if(pd > today) return;
+    const days = Math.round((new Date(pd+'T00:00:00')
+                           - new Date(b.due+'T00:00:00')) / 86400000);
+    if(!isFinite(days)) return;
+    if(days > 0) late++; else onTime++;
+    let rec = byTenant.get(t.id);
+    if(!rec) byTenant.set(t.id, rec = { id:t.id, name:t.name, unit:t.unit, n:0, lateDaysSum:0, lateCount:0 });
+    rec.n++;
+    if(days > 0){ rec.lateDaysSum += days; rec.lateCount++; }
+  }));
+  const latePayers = Array.from(byTenant.values())
+    .filter(r => r.lateCount > 0)
+    .map(r => ({ ...r, avgLate: r.lateDaysSum / r.lateCount }))
+    .sort((a,b) => b.avgLate - a.avgLate);
+  return { onTime, late, total: onTime + late, latePayers };
+}
+
+// Click-through from an insight: REPLACE the active filters (don't stack on
+// top of them) so the resulting list matches the numbers in the sentence the
+// admin clicked. Tenant ids travel via data attributes, never spliced into
+// inline JS strings.
+function insightFilter(o) {
+  o = o || {};
+  filterTenantId = o.tenant || '';
+  filterMonth    = o.month || '';
+  filterFloor    = '';
+  filterSearch   = '';
+  filterStatuses = o.statuses || [];
+  applyFilters();
+}
+
+// The digest behind the "Key Findings" card. Charts show data; these
+// sentences say what it means and what to do about it. Returns
+// [{tone:'bad'|'warn'|'info'|'good', html, action?, tid?}] ordered
+// worst-first; `tid` rides along as a data attribute for tenant actions.
+function _insightFindings(months) {
+  const F = [];
+  const peso = v => '&#8369;' + Math.round(Math.abs(v)).toLocaleString();
+  const curYM  = months[months.length-1];
+  const prevYM = months[months.length-2];
+  const monName = ym => new Date(ym+'-02').toLocaleString('default',{month:'long'});
+  const expensesUsable = expensesAvailable && !_expensesLoadError;
+
+  // 1. Collection pace this month, with last month's close for scale.
+  // "Collected" counts cash received this month for ANY bill, so settled
+  // back-balances can push the rate past 100% — phrase that case honestly
+  // instead of printing "300% collected".
+  const billedNow = _billedInMonth(curYM), colNow = _collectedInMonth(curYM);
+  if(billedNow > 0) {
+    const rate = colNow / billedNow;
+    const prevBilled = _billedInMonth(prevYM);
+    const prevRate = prevBilled > 0 ? _collectedInMonth(prevYM)/prevBilled : null;
+    if(rate > 1) {
+      F.push({ tone:'good', html: 'Collections this month ('+peso(colNow)+') already exceed the '
+        + peso(billedNow)+' billed for '+monName(curYM)+' &mdash; older balances are being settled too.' });
+    } else {
+      // A low rate on the 5th is normal; the same rate on the 25th is a problem.
+      const dayOfMonth = new Date().getDate();
+      const tone = rate >= 0.9 ? 'good'
+                 : (dayOfMonth >= 20 && rate < 0.6) ? 'bad'
+                 : (dayOfMonth >= 15 && rate < 0.75) ? 'warn' : 'info';
+      const prevClause = prevRate == null ? '.'
+        : prevRate > 1 ? ' &mdash; '+monName(prevYM)+' collected more than it billed.'
+        : ' &mdash; '+monName(prevYM)+' closed at '+Math.round(prevRate*100)+'%.';
+      F.push({ tone, html: Math.round(rate*100)+'% of '+monName(curYM)+'&rsquo;s '+peso(billedNow)
+        + ' billed has been collected'+prevClause });
+    }
+  }
+
+  // 2. Last month's bills still carrying a balance.
+  const prevBilled = _billedInMonth(prevYM);
+  const prevOut = _outstandingForMonth(prevYM);
+  if(prevBilled > 0 && prevOut.total > prevBilled*0.2) {
+    F.push({ tone: prevOut.total > prevBilled*0.4 ? 'bad' : 'warn',
+      html: peso(prevOut.total)+' across '+prevOut.count+' bill'+(prevOut.count!==1?'s':'')
+        + ' due in '+monName(prevYM)+' is still unpaid &mdash; worth chasing before it ages past 30 days.',
+      action: { month: prevYM, statuses: ['overdue'] } });
+  }
+
+  // 2b. Undated unpaid bills can't age, go overdue, or appear in monthly
+  // sweeps — surface them so the all-clear can't hide real balances.
+  let undatedTotal = 0, undatedCount = 0;
+  tenants.forEach(t => (t.bills||[]).forEach(b => {
+    if(b.status==='paid' || b.due) return;
+    const rem = Math.max(0, billRemaining(b));
+    if(rem > 0){ undatedTotal += rem; undatedCount++; }
+  }));
+  if(undatedTotal > 0) {
+    F.push({ tone:'info', html: peso(undatedTotal)+' across '+undatedCount+' bill'
+      + (undatedCount!==1?'s':'')+' has no due date &mdash; it can&rsquo;t show up as overdue or in reminders until one is set.' });
+  }
+
+  // 3. Overdue concentration: when most of the overdue money sits with one
+  // tenant, one reminder moves the biggest number.
+  const debtors = tenants.map(t => ({ t,
+    bal: (t.bills||[]).filter(b => b.status!=='paid' && getDueStatus(b)==='overdue')
+      .reduce((s,b) => s + Math.max(0, billRemaining(b)), 0)
+  })).filter(x => x.bal > 0).sort((a,b) => b.bal - a.bal);
+  const overdueTotal = debtors.reduce((s,x) => s + x.bal, 0);
+  if(overdueTotal > 0) {
+    const top = debtors[0];
+    const share = top.bal / overdueTotal;
+    const unitClause = (top.t.unit ? ' (Unit '+esc(top.t.unit)+')' : '');
+    if(debtors.length === 1) {
+      F.push({ tone:'warn', html: 'All '+peso(overdueTotal)+' overdue belongs to '+esc(top.t.name)
+        + unitClause+' &mdash; one reminder covers it.', tid: top.t.id });
+    } else if(share >= 0.4) {
+      F.push({ tone:'warn', html: esc(top.t.name)+' holds '+peso(top.bal)+' of the '
+        + peso(overdueTotal)+' overdue ('+Math.round(share*100)+'%) &mdash; one reminder moves most of it.',
+        tid: top.t.id });
+    }
+  }
+
+  // 4. Habitual late payers (needs a bit of history to be fair).
+  const pb = _paymentBehavior(months);
+  const chronic = pb.latePayers.filter(r => r.n >= 2 && r.lateCount >= 2
+    && r.lateCount/r.n >= 0.5 && r.avgLate >= 3);
+  if(chronic.length) {
+    const c = chronic[0];
+    const others = chronic.length - 1;
+    F.push({ tone:'warn', html: esc(c.name)+' settles bills about '+Math.round(c.avgLate)
+      + ' days late ('+c.lateCount+' of '+c.n+' bills'+')'
+      + (others ? ', and '+others+' more tenant'+(others!==1?'s show':' shows')+' the same pattern' : '')
+      + ' &mdash; a reminder a few days before the due date usually fixes this.',
+      tid: c.id });
+  }
+
+  // 5. Utility cost spikes — a bill well above its own recent average is
+  // worth a look (usage jump, rate hike, a leak, or a billing error).
+  if(expensesUsable) {
+    [['electricity','Electricity'], ['water','Water']].forEach(([cat, label]) => {
+      const cur = _expenseCatInMonth(curYM, cat);
+      const prior = months.slice(0,-1).map(m => _expenseCatInMonth(m, cat)).filter(v => v > 0);
+      if(cur <= 0 || prior.length < 2) return;
+      const avg = prior.reduce((s,v) => s + v, 0) / prior.length;
+      const ratio = cur / avg;
+      if(ratio >= 1.3) {
+        F.push({ tone:'warn', html: label+' spend this month ('+peso(cur)+') is '
+          + Math.round((ratio-1)*100)+'% above its recent average ('+peso(avg)+') &mdash; worth checking the bill.' });
+      } else if(ratio <= 0.7) {
+        F.push({ tone:'good', html: label+' spend this month ('+peso(cur)+') is '
+          + Math.round((1-ratio)*100)+'% below its recent average.' });
+      }
+    });
+  }
+
+  // 6. Where the utility money went: billed back vs absorbed. This is the
+  // all-inclusive story — flat-rate tenants' utilities are never billed
+  // back, so the absorbed share is what their rate has to cover. Both sides
+  // of the comparison cover the SAME utilities (electricity, water,
+  // internet); recharges billCategory can't match to an expense category
+  // (gas, cable, generic "utilities") stay out of it.
+  if(expensesUsable) {
+    const utilCats = ['electricity','water','internet'];
+    let recYM = null, paid = 0;
+    for(let i = months.length-1; i >= 0; i--) {
+      const p = utilCats.reduce((s,c) => s + _expenseCatInMonth(months[i], c), 0);
+      if(p > 0){ recYM = months[i]; paid = p; break; }
+    }
+    if(recYM) {
+      const u = _utilityBilledInMonth(recYM);
+      const billedBack = u.electricity + u.water + u.internet;
+      const absorbed = paid - billedBack;
+      const nInc = _inclusiveTenantCount();
+      if(absorbed > 0) {
+        F.push({ tone:'info', html: monName(recYM)+' utilities: '+peso(paid)+' paid, '
+          + peso(billedBack)+' billed back to itemized tenants &mdash; '+peso(absorbed)
+          + ' stayed with the building'
+          + (nInc ? ' (the share the '+nInc+' all-inclusive rate'+(nInc!==1?'s':'')+' must cover)' : '')
+          + '.' });
+      } else if(billedBack > 0) {
+        F.push({ tone:'good', html: monName(recYM)+' utilities: '+peso(billedBack)
+          + ' billed back against '+peso(paid)+' paid &mdash; recharges fully cover the utility spend.' });
+      }
+    }
+  }
+
+  // 7. A month that closed in the red is the headline, not a footnote.
+  if(expensesUsable) {
+    const prevExp = _expensesInMonth(prevYM);
+    const prevNet = _collectedInMonth(prevYM) - prevExp;
+    if(prevExp > 0 && prevNet < 0) {
+      F.push({ tone:'bad', html: monName(prevYM)+' closed in the red: expenses exceeded collections by '
+        + peso(-prevNet)+' &mdash; the Net Position card has the month-by-month picture.' });
+    }
+  }
+
+  const rank = { bad:0, warn:1, info:2, good:3 };
+  F.sort((a,b) => rank[a.tone] - rank[b.tone]);
+  if(!F.length) F.push({ tone:'good', html:'Nothing needs attention &mdash; collections are on pace and utility spend is steady.' });
+  return F.slice(0, 6);
+}
 
 function renderInsights() {
   // No tenants → don't render the panel at all.
@@ -1094,69 +1437,149 @@ function renderInsights() {
     + dots + xLabels
     + '</svg>';
 
-  // ── 2. Status donut ──
-  // Snapshot of the current workload: all ACTIVE bills by urgency, plus bills
-  // paid this month (so progress is visible without drowning in years of
-  // historical paid bills).
-  const curYM = _currentYM();
-  const statusCounts = { overdue:0, 'due-today':0, 'due-soon':0, upcoming:0, 'no-date':0 };
-  let paidThisMonth = 0;
-  tenants.forEach(t => (t.bills||[]).forEach(b => {
-    const ds = getDueStatus(b);
-    if(ds === 'paid'){
-      if(b.paidDate && String(b.paidDate).startsWith(curYM)) paidThisMonth++;
-      return;
-    }
-    if(statusCounts[ds] !== undefined) statusCounts[ds]++;
-  }));
-  // Combine due-today into overdue colour group for visual clarity (both red).
-  const donutSlices = [
-    { key:'overdue',  label:'Overdue',   value: statusCounts.overdue + statusCounts['due-today'], color:'#c0392b' },
-    { key:'due-soon', label:'Due Soon',  value: statusCounts['due-soon'], color:'#e67e22' },
-    { key:'upcoming', label:'Upcoming',  value: statusCounts.upcoming + statusCounts['no-date'], color:'#5b88e6' },
-    { key:'paid',     label:'Paid this month', value: paidThisMonth, color:'#1e8449' }
-  ];
-  const donutTotal = donutSlices.reduce((s,x)=>s+x.value, 0);
-  const DW = 180, DH = 180, DCx = 90, DCy = 90, Rout = 70, Rin = 44;
-  let donutSvg;
-  if(donutTotal === 0){
-    donutSvg = '<svg viewBox="0 0 '+DW+' '+DH+'" class="cg-svg cg-donut-svg" role="img" aria-label="No bills">'
-      + '<circle cx="'+DCx+'" cy="'+DCy+'" r="'+Rout+'" class="cg-donut-empty"/>'
-      + '<text x="'+DCx+'" y="'+DCy+'" class="cg-donut-empty-text">No bills</text>'
-      + '</svg>';
-  } else {
-    let cumAngle = -Math.PI/2; // start at 12 o'clock
-    const arcs = donutSlices.filter(s=>s.value>0).map(s => {
-      const frac = s.value / donutTotal;
-      const a0 = cumAngle, a1 = cumAngle + frac*2*Math.PI;
-      cumAngle = a1;
-      // Edge case: a single 100% slice can't be drawn as an arc; render two halves.
-      if(frac >= 0.999){
-        return '<circle cx="'+DCx+'" cy="'+DCy+'" r="'+((Rout+Rin)/2)+'" fill="none" stroke="'+s.color+'" stroke-width="'+(Rout-Rin)+'"><title>'+s.label+': '+s.value+'</title></circle>';
-      }
-      const x0 = DCx + Rout*Math.cos(a0), y0 = DCy + Rout*Math.sin(a0);
-      const x1 = DCx + Rout*Math.cos(a1), y1 = DCy + Rout*Math.sin(a1);
-      const x2 = DCx + Rin*Math.cos(a1),  y2 = DCy + Rin*Math.sin(a1);
-      const x3 = DCx + Rin*Math.cos(a0),  y3 = DCy + Rin*Math.sin(a0);
-      const large = frac > 0.5 ? 1 : 0;
-      const d = 'M'+x0.toFixed(2)+','+y0.toFixed(2)
-              + ' A'+Rout+','+Rout+' 0 '+large+' 1 '+x1.toFixed(2)+','+y1.toFixed(2)
-              + ' L'+x2.toFixed(2)+','+y2.toFixed(2)
-              + ' A'+Rin+','+Rin+' 0 '+large+' 0 '+x3.toFixed(2)+','+y3.toFixed(2)
-              + ' Z';
-      return '<path d="'+d+'" fill="'+s.color+'"><title>'+s.label+': '+s.value+'</title></path>';
-    }).join('');
-    donutSvg = '<svg viewBox="0 0 '+DW+' '+DH+'" class="cg-svg cg-donut-svg" role="img" aria-label="Bill status distribution">'
-      + arcs
-      + '<text x="'+DCx+'" y="'+(DCy-4)+'" class="cg-donut-num">'+donutTotal+'</text>'
-      + '<text x="'+DCx+'" y="'+(DCy+12)+'" class="cg-donut-lbl">bills</text>'
-      + '</svg>';
-  }
-  const donutLegend = '<div class="cg-legend">'
-    + donutSlices.map(s => '<span class="cg-legend-item"><span class="cg-legend-dot" style="background:'+s.color+'"></span>'+s.label+' <span class="cg-legend-val">'+s.value+'</span></span>').join('')
+  // ── 2. Key Findings digest ──
+  // Tenant-targeted findings carry a `tid` that rides in a data attribute;
+  // other actions are code-built filter objects serialized into the handler.
+  // Neither path splices data into a JS string context.
+  const findings = _insightFindings(months);
+  const kfHtml = '<div class="kf-list">'
+    + findings.map(f => {
+        const clickable = !!(f.tid || f.action);
+        let attrs = '';
+        if(f.tid) attrs = ' data-tid="'+esc(f.tid)+'" onclick="insightFilter({tenant:this.dataset.tid})"';
+        else if(f.action) attrs = ' onclick="insightFilter('+JSON.stringify(f.action).replace(/"/g,'&quot;')+')"';
+        return '<div class="kf-item kf-'+f.tone+(clickable?' kf-click':'')+'"'
+          + (clickable ? ' role="button" tabindex="0" onkeydown="if(event.key===\'Enter\')this.click()"'+attrs : '')+'>'
+          + '<span class="kf-dot"></span><span class="kf-text">'+f.html+'</span>'
+          + (clickable ? '<span class="kf-go" aria-hidden="true">&rsaquo;</span>' : '')
+          + '</div>';
+      }).join('')
     + '</div>';
 
-  // ── 3. Top tenants by outstanding balance ──
+  // ── 3. Utilities ──
+  // What the building pays for electricity and water (from the expenses
+  // ledger) charted against what got billed back to itemized tenants.
+  let utilCardHtml = '';
+  if(expensesAvailable) {
+    const elec  = months.map(m => _expenseCatInMonth(m, 'electricity'));
+    const water = months.map(m => _expenseCatInMonth(m, 'water'));
+    // The green marker must cover the same utilities as the bars it sits
+    // against (electricity + water) — internet/gas/cable recharges would
+    // inflate it into "fully recovered" readings the bars don't support.
+    const billedBack = months.map(m => {
+      const u = _utilityBilledInMonth(m);
+      return u.electricity + u.water;
+    });
+    const hasSpend = elec.some(v=>v>0) || water.some(v=>v>0);
+    const hasAny = hasSpend || billedBack.some(v=>v>0);
+    let utilBody;
+    if(_expensesLoadError) {
+      utilBody = '<div class="cg-bar-empty" style="color:var(--muted)">Expenses could not be loaded &mdash; refresh to see utility figures.</div>';
+    } else if(!hasAny) {
+      utilBody = '<div class="cg-bar-empty" style="color:var(--muted)">No utility spend recorded yet. Log electricity and water bills in the Expenses panel below &mdash; the category drives this chart.</div>';
+    } else {
+      const uMax = Math.max(1, ...elec, ...water, ...billedBack);
+      const UW = 560, UH = 170, UPL = 36, UPR = 12, UPT = 16, UPB = 28;
+      const uInnerW = UW-UPL-UPR, uInnerH = UH-UPT-UPB;
+      const slotW = uInnerW / months.length;
+      const uYAt = v => UPT + uInnerH - (v/uMax)*uInnerH;
+      const uGrid = [0, 0.33, 0.66, 1].map(f => {
+        const y = (UPT + uInnerH - f*uInnerH).toFixed(1);
+        const v = Math.round(uMax * f);
+        const lbl = v >= 1000 ? (v/1000).toFixed(v>=10000?0:1)+'k' : v;
+        return '<line x1="'+UPL+'" y1="'+y+'" x2="'+(UW-UPR)+'" y2="'+y+'" class="cg-grid"/>'
+             + '<text x="'+(UPL-6)+'" y="'+y+'" class="cg-axis cg-axis-y">'+lbl+'</text>';
+      }).join('');
+      const barW = Math.min(18, slotW*0.26);
+      const uBars = months.map((ym,i) => {
+        const cx = UPL + slotW*i + slotW/2;
+        const mLbl = _ymLabel(ym);
+        const parts = [];
+        const bar = (x, v, cls, title) => {
+          if(v <= 0) return '';
+          const y = uYAt(v);
+          return '<rect x="'+x.toFixed(1)+'" y="'+y.toFixed(1)+'" width="'+barW.toFixed(1)
+            + '" height="'+(UPT+uInnerH-y).toFixed(1)+'" rx="2" class="'+cls+'"><title>'+title+'</title></rect>';
+        };
+        parts.push(bar(cx-barW-1, elec[i], 'cg-ubar-elec',
+          'Electricity '+mLbl+': ₱'+elec[i].toLocaleString()));
+        parts.push(bar(cx+1, water[i], 'cg-ubar-water',
+          'Water '+mLbl+': ₱'+water[i].toLocaleString()));
+        if(billedBack[i] > 0) {
+          const y = uYAt(billedBack[i]).toFixed(1);
+          parts.push('<line x1="'+(cx-slotW*0.34).toFixed(1)+'" y1="'+y+'" x2="'+(cx+slotW*0.34).toFixed(1)+'" y2="'+y
+            + '" class="cg-ubar-billed"><title>Electricity + water billed to tenants '+mLbl+': ₱'+billedBack[i].toLocaleString()+'</title></line>');
+        }
+        parts.push('<text x="'+cx.toFixed(1)+'" y="'+(UH-8)+'" class="cg-axis cg-axis-x">'+mLbl+'</text>');
+        return parts.join('');
+      }).join('');
+      const utilSvg = '<svg viewBox="0 0 '+UW+' '+UH+'" class="cg-svg" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Monthly electricity and water spend vs utilities billed to tenants">'
+        + uGrid + uBars + '</svg>';
+      // Latest month with utility spend → the summary rows under the chart.
+      let li = -1;
+      for(let i = months.length-1; i >= 0; i--) { if(elec[i]>0 || water[i]>0){ li = i; break; } }
+      let uRows = '';
+      if(li >= 0) {
+        const lMon = new Date(months[li]+'-02').toLocaleString('default',{month:'long'});
+        const row = (dotCls, label, v) => v>0
+          ? '<div class="uu-row"><span class="cg-legend-dot '+dotCls+'"></span><span class="uu-row-label">'+label+'</span>'
+            + '<span class="uu-row-val">&#8369;'+v.toLocaleString()+'</span></div>'
+          : '';
+        uRows = '<div class="uu-rows"><div class="uu-rows-label">'+lMon+'</div>'
+          + row('uu-dot-elec', 'Electricity', elec[li])
+          + row('uu-dot-water', 'Water', water[li])
+          + row('uu-dot-billed', 'Billed to tenants', billedBack[li])
+          + '</div>';
+      }
+      const nInc = _inclusiveTenantCount();
+      const note = nInc
+        ? nInc+' of '+tenants.length+' tenant'+(tenants.length!==1?'s':'')+' '+(nInc===1?'is':'are')+' all-inclusive: their utilities are never billed back &mdash; that share stays in these bars as a building expense the flat rate must cover.'
+        : 'Spend without a matching recharge (the green marks) is shouldered by the building.';
+      utilBody = utilSvg
+        + '<div class="cg-legend cg-legend-line">'
+        +   '<span class="cg-legend-item"><span class="cg-legend-dot uu-dot-elec"></span>Electricity</span>'
+        +   '<span class="cg-legend-item"><span class="cg-legend-dot uu-dot-water"></span>Water</span>'
+        +   '<span class="cg-legend-item"><span class="uu-billed-swatch"></span>Billed to tenants</span>'
+        + '</div>'
+        + uRows
+        + '<div class="uu-note">'+note+'</div>';
+    }
+    utilCardHtml = '<div class="insights-card insights-card-utils">'
+      + '<div class="insights-card-title">Utilities <span class="insights-card-sub">paid vs billed back &middot; last 6 months</span></div>'
+      + utilBody
+      + '</div>';
+  }
+
+  // ── 4. Payment behavior ──
+  const pb = _paymentBehavior(months);
+  let pbBody;
+  if(pb.total === 0) {
+    pbBody = '<div class="cg-bar-empty" style="color:var(--muted)">No paid bills due in the last 6 months yet &mdash; punctuality shows up here once dated bills are marked paid.</div>';
+  } else {
+    const pct = Math.round(pb.onTime / pb.total * 100);
+    const headline = '<div class="pb-headline"><span class="pb-num '+(pct>=80?'pos':pct>=50?'':'neg')+'">'+pct+'%</span> paid on time'
+      + '<span class="pb-sub">'+pb.onTime+' of '+pb.total+' bill'+(pb.total!==1?'s':'')+' due in the last 6 months</span></div>';
+    const shown = pb.latePayers.filter(r => r.avgLate >= 1).slice(0,5);
+    let bars;
+    if(!shown.length) {
+      bars = '<div class="cg-bar-empty">Every payment landed on or before its due date.</div>';
+    } else {
+      const maxLate = shown[0].avgLate || 1;
+      bars = '<div class="cg-bars">'
+        + shown.map(r => {
+            const pctW = (r.avgLate / maxLate * 100).toFixed(1);
+            return '<div class="cg-bar-row" role="button" tabindex="0" data-tid="'+esc(r.id)+'" onkeydown="if(event.key===\'Enter\')this.click()" onclick="insightFilter({tenant:this.dataset.tid})" title="Filter to '+esc(r.name)+'">'
+              + '<div class="cg-bar-name">'+esc(r.name)+(r.unit?' <span class="cg-bar-unit">&middot; Unit '+esc(r.unit)+'</span>':'')+'</div>'
+              + '<div class="cg-bar-track"><div class="cg-bar-fill cg-bar-fill-late" style="width:'+pctW+'%"></div></div>'
+              + '<div class="cg-bar-val">~'+Math.round(r.avgLate)+'d late <span class="cg-bar-unit">&middot; '+r.lateCount+' of '+r.n+'</span></div>'
+              + '</div>';
+          }).join('')
+        + '</div>';
+    }
+    pbBody = headline + bars;
+  }
+
+  // ── 5. Top tenants by outstanding balance ──
   const tenantBalances = tenants.map(t => ({
     name: t.name,
     unit: t.unit,
@@ -1171,8 +1594,8 @@ function renderInsights() {
     barSvg = '<div class="cg-bars">'
       + tenantBalances.map(x => {
           const pct = (x.balance / barMax * 100).toFixed(1);
-          return '<div class="cg-bar-row" role="button" tabindex="0" onkeydown="if(event.key===\'Enter\')this.click()" onclick="filterTenantId=\''+esc(x.id)+'\';applyFilters()" title="Filter to '+esc(x.name)+'">'
-               + '<div class="cg-bar-name">'+esc(x.name)+' <span class="cg-bar-unit">· Unit '+esc(x.unit)+'</span></div>'
+          return '<div class="cg-bar-row" role="button" tabindex="0" data-tid="'+esc(x.id)+'" onkeydown="if(event.key===\'Enter\')this.click()" onclick="insightFilter({tenant:this.dataset.tid})" title="Filter to '+esc(x.name)+'">'
+               + '<div class="cg-bar-name">'+esc(x.name)+(x.unit?' <span class="cg-bar-unit">· Unit '+esc(x.unit)+'</span>':'')+'</div>'
                + '<div class="cg-bar-track"><div class="cg-bar-fill" style="width:'+pct+'%"></div></div>'
                + '<div class="cg-bar-val">&#8369;'+x.balance.toLocaleString()+'</div>'
                + '</div>';
@@ -1180,7 +1603,7 @@ function renderInsights() {
       + '</div>';
   }
 
-  // ── 4. Overdue aging buckets ──
+  // ── 6. Overdue aging buckets ──
   // How long has overdue money been sitting? Buckets by days past due.
   const agingBuckets = [
     { label: '1–30 days',  min: 1,  max: 30,  count: 0, amt: 0 },
@@ -1194,7 +1617,7 @@ function renderInsights() {
     const bk = agingBuckets.find(x => d >= x.min && d <= x.max);
     if(bk){ bk.count++; bk.amt += Math.max(0, billRemaining(b)); }
   }));
-  // ── 5. Net position: collected − expenses, per month ──
+  // ── 7. Net position: collected − expenses, per month ──
   // Only rendered when the expenses table exists; the whole point is showing
   // whether all-inclusive rates still clear a margin after utilities.
   let netCardHtml = '';
@@ -1202,7 +1625,7 @@ function renderInsights() {
     // A transient load failure must not render collected − ₱0 as "profit".
     netCardHtml = '<div class="insights-card insights-card-net">'
       + '<div class="insights-card-title">Net Position <span class="insights-card-sub">collected &minus; expenses</span></div>'
-      + '<div class="cg-bar-empty">Expenses could not be loaded — refresh to see real figures.</div>'
+      + '<div class="cg-bar-empty" style="color:var(--muted)">Expenses could not be loaded — refresh to see real figures.</div>'
       + '</div>';
   } else if(expensesAvailable) {
     const peso = v => '&#8369;'+Math.abs(v).toLocaleString();
@@ -1231,7 +1654,7 @@ function renderInsights() {
     : '<div class="cg-bars">'
       + agingBuckets.map(x => {
           const pct = (x.amt / agingMax * 100).toFixed(1);
-          return '<div class="cg-bar-row" role="button" tabindex="0" onkeydown="if(event.key===\'Enter\')this.click()" onclick="filterStatuses=[\'overdue\'];applyFilters()" title="Show overdue bills">'
+          return '<div class="cg-bar-row" role="button" tabindex="0" onkeydown="if(event.key===\'Enter\')this.click()" onclick="insightFilter({statuses:[\'overdue\']})" title="Show overdue bills">'
                + '<div class="cg-bar-name">'+x.label+' <span class="cg-bar-unit">· '+x.count+' bill'+(x.count!==1?'s':'')+'</span></div>'
                + '<div class="cg-bar-track"><div class="cg-bar-fill cg-bar-fill-aging" style="width:'+pct+'%"></div></div>'
                + '<div class="cg-bar-val">&#8369;'+x.amt.toLocaleString()+'</div>'
@@ -1247,6 +1670,10 @@ function renderInsights() {
     + (_insightsOpen
         ? '<div class="insights-body">'
           + '<div class="insights-grid">'
+          +   '<div class="insights-card insights-card-kf">'
+          +     '<div class="insights-card-title">Key Findings <span class="insights-card-sub">what the numbers are saying</span></div>'
+          +     kfHtml
+          +   '</div>'
           +   '<div class="insights-card insights-card-line">'
           +     '<div class="insights-card-title">Billed vs Collected <span class="insights-card-sub">last 6 months</span></div>'
           +     lineSvg
@@ -1255,11 +1682,11 @@ function renderInsights() {
           +       '<span class="cg-legend-item"><span class="cg-legend-dot" style="background:#1e8449"></span>Collected</span>'
           +     '</div>'
           +   '</div>'
-          +   '<div class="insights-card insights-card-donut">'
-          +     '<div class="insights-card-title">Bill Status <span class="insights-card-sub">active + paid this month</span></div>'
-          +     donutSvg
-          +     donutLegend
+          +   '<div class="insights-card insights-card-pb">'
+          +     '<div class="insights-card-title">Payment Behavior <span class="insights-card-sub">click a name to filter</span></div>'
+          +     pbBody
           +   '</div>'
+          +   utilCardHtml
           +   '<div class="insights-card insights-card-bars">'
           +     '<div class="insights-card-title">Top Outstanding <span class="insights-card-sub">click to filter</span></div>'
           +     barSvg
