@@ -1226,6 +1226,11 @@ function _paymentBehavior(months) {
 // top of them) so the resulting list matches the numbers in the sentence the
 // admin clicked. Tenant ids travel via data attributes, never spliced into
 // inline JS strings.
+//
+// The filtered list lives well below the insights panel, and rerenderAdmin()
+// restores the pre-render scroll position — so without the scroll and toast
+// below, clicking an insight changed the page a thousand pixels out of sight
+// and read as a dead click.
 function insightFilter(o) {
   o = o || {};
   filterTenantId = o.tenant || '';
@@ -1234,6 +1239,33 @@ function insightFilter(o) {
   filterSearch   = '';
   filterStatuses = o.statuses || [];
   applyFilters();
+
+  // Name what was applied, so the click is acknowledged instantly — before
+  // the scroll even lands, and on phones where the list is further away.
+  const statusLabels = { overdue:'overdue', 'due-today':'due today', 'due-soon':'due soon', upcoming:'upcoming', paid:'paid' };
+  const parts = [];
+  if(o.tenant) {
+    const t = tenants.find(x => x.id === o.tenant);
+    if(t) parts.push(t.name);
+  }
+  if(o.statuses && o.statuses.length) parts.push(o.statuses.map(s => statusLabels[s]||s).join(' + ')+' bills');
+  if(o.month) parts.push('due in '+new Date(o.month+'-02').toLocaleString('default',{month:'long',year:'numeric'}));
+  showToast(parts.length ? 'Showing '+parts.join(' · ') : 'Filters cleared.');
+
+  scrollToTenantList();
+}
+
+// Bring the tenant list into view. rerenderAdmin() re-applies the old scroll
+// position on the next animation frame, so this has to run after that frame
+// or it gets undone.
+function scrollToTenantList() {
+  const jump = () => {
+    const el = document.querySelector('.section-bar');
+    if(!el) return;
+    const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    el.scrollIntoView({ behavior: reduce ? 'auto' : 'smooth', block: 'start' });
+  };
+  requestAnimationFrame(()=>requestAnimationFrame(jump));
 }
 
 // The digest behind the "Key Findings" card. Charts show data; these
@@ -1553,6 +1585,7 @@ function renderInsights() {
   // ── 4. Payment behavior ──
   const pb = _paymentBehavior(months);
   let pbBody;
+  let pbClickable = false; // drives the "click a name to filter" hint
   if(pb.total === 0) {
     pbBody = '<div class="cg-bar-empty" style="color:var(--muted)">No paid bills due in the last 6 months yet &mdash; punctuality shows up here once dated bills are marked paid.</div>';
   } else {
@@ -1564,6 +1597,7 @@ function renderInsights() {
     if(!shown.length) {
       bars = '<div class="cg-bar-empty">Every payment landed on or before its due date.</div>';
     } else {
+      pbClickable = true;
       const maxLate = shown[0].avgLate || 1;
       bars = '<div class="cg-bars">'
         + shown.map(r => {
@@ -1683,12 +1717,14 @@ function renderInsights() {
           +     '</div>'
           +   '</div>'
           +   '<div class="insights-card insights-card-pb">'
-          +     '<div class="insights-card-title">Payment Behavior <span class="insights-card-sub">click a name to filter</span></div>'
+          +     '<div class="insights-card-title">Payment Behavior'
+          +       (pbClickable ? ' <span class="insights-card-sub">click a name to filter</span>' : ' <span class="insights-card-sub">last 6 months</span>')+'</div>'
           +     pbBody
           +   '</div>'
           +   utilCardHtml
           +   '<div class="insights-card insights-card-bars">'
-          +     '<div class="insights-card-title">Top Outstanding <span class="insights-card-sub">click to filter</span></div>'
+          +     '<div class="insights-card-title">Top Outstanding'
+          +       (tenantBalances.length ? ' <span class="insights-card-sub">click a name to filter</span>' : ' <span class="insights-card-sub">unpaid balances</span>')+'</div>'
           +     barSvg
           +   '</div>'
           +   '<div class="insights-card insights-card-aging">'
