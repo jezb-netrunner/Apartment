@@ -288,6 +288,94 @@
   </div>
 </div>
 
+<!-- INCOME STATEMENT MODAL -->
+<div id="incstmt-modal" role="dialog" aria-modal="true" aria-labelledby="incstmt-title">
+  <div class="stmt-box">
+    <div class="stmt-eyebrow">Report</div>
+    <div class="stmt-title" id="incstmt-title">Income Statement</div>
+    <div class="stmt-sub">Payments collected minus building expenses &mdash; the preview updates live.</div>
+    <div class="stmt-layout">
+      <div class="stmt-opts">
+        <div class="stmt-opt-section">
+          <div class="stmt-opt-label">Period</div>
+          <div class="stmt-presets" id="incstmt-presets">
+            <button type="button" class="stmt-preset" data-preset="this" onclick="setIncStmtPreset('this')">This month</button>
+            <button type="button" class="stmt-preset" data-preset="last" onclick="setIncStmtPreset('last')">Last month</button>
+            <button type="button" class="stmt-preset" data-preset="3m" onclick="setIncStmtPreset('3m')">3 months</button>
+            <button type="button" class="stmt-preset" data-preset="6m" onclick="setIncStmtPreset('6m')">6 months</button>
+            <button type="button" class="stmt-preset" data-preset="ytd" onclick="setIncStmtPreset('ytd')">This year</button>
+            <button type="button" class="stmt-preset" data-preset="all" onclick="setIncStmtPreset('all')">All time</button>
+          </div>
+          <div class="stmt-range">
+            <div class="stmt-mini-field"><label for="incstmt-from">From</label><input type="month" id="incstmt-from" onchange="incStmtRangeEdited()"></div>
+            <div class="stmt-mini-field"><label for="incstmt-to">To</label><input type="month" id="incstmt-to" onchange="incStmtRangeEdited()"></div>
+          </div>
+        </div>
+        <div class="stmt-opt-section">
+          <div class="stmt-opt-label">Content</div>
+          <div class="stmt-checks">
+            <label><input type="checkbox" id="incstmt-inc-detail" onchange="incStmtOptsChanged()"> Income by category</label>
+            <label><input type="checkbox" id="incstmt-exp-detail" onchange="incStmtOptsChanged()"> Expense breakdown</label>
+            <label><input type="checkbox" id="incstmt-monthly" onchange="incStmtOptsChanged()"> Month-by-month table</label>
+            <label><input type="checkbox" id="incstmt-memo" onchange="incStmtOptsChanged()"> Collections memo</label>
+            <label><input type="checkbox" id="incstmt-sign" onchange="incStmtOptsChanged()"> Signature lines</label>
+          </div>
+          <div class="stmt-mini-field">
+            <label for="incstmt-note">Note on report <span class="stmt-opt-optional">(optional)</span></label>
+            <textarea id="incstmt-note" rows="2" maxlength="400" placeholder="e.g. Prepared for the building owner." oninput="incStmtOptsChanged()"></textarea>
+          </div>
+        </div>
+        <div class="stmt-opt-section">
+          <div class="stmt-opt-label">Appearance</div>
+          <div class="stmt-mini-grid">
+            <div class="stmt-mini-field">
+              <label for="incstmt-size">Text size</label>
+              <select id="incstmt-size" onchange="incStmtOptsChanged()">
+                <option value="compact">Compact</option>
+                <option value="normal">Normal</option>
+                <option value="large">Large</option>
+              </select>
+            </div>
+            <div class="stmt-mini-field">
+              <label for="incstmt-theme">Ink</label>
+              <select id="incstmt-theme" onchange="incStmtOptsChanged()">
+                <option value="color">Color</option>
+                <option value="bw">Black &amp; white</option>
+              </select>
+            </div>
+            <div class="stmt-mini-field">
+              <label for="incstmt-paper">Paper</label>
+              <select id="incstmt-paper" onchange="incStmtOptsChanged()">
+                <option value="a4">A4</option>
+                <option value="letter">Letter</option>
+              </select>
+            </div>
+            <div class="stmt-mini-field">
+              <label for="incstmt-orient">Layout</label>
+              <select id="incstmt-orient" onchange="incStmtOptsChanged()">
+                <option value="portrait">Portrait</option>
+                <option value="landscape">Landscape</option>
+              </select>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="stmt-preview-col">
+        <div class="stmt-preview-frame" id="incstmt-preview-frame">
+          <div class="stmt-preview-scale" id="incstmt-preview-scale">
+            <iframe id="incstmt-preview" title="Income statement preview"></iframe>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="stmt-actions">
+      <div class="stmt-actions-hint" id="incstmt-hint"></div>
+      <button class="btn-cancel" onclick="closeIncStmtModal()">Close</button>
+      <button class="btn-save" onclick="printIncomeStatement()">Print / Save PDF</button>
+    </div>
+  </div>
+</div>
+
 <!-- QUICK ADD BILL MODAL -->
 <div id="addbill-modal" role="dialog" aria-modal="true" aria-labelledby="addbill-title">
   <div class="qb-box">

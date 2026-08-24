@@ -431,15 +431,15 @@ function renderStmtPreview() {
   setTimeout(fitStmtPreview, 120);
 }
 
-// Scale the paper-sized iframe down to fit the preview pane.
-function fitStmtPreview() {
-  const frame = document.getElementById('stmt-preview-frame');
-  const scaleDiv = document.getElementById('stmt-preview-scale');
-  const iframe = document.getElementById('stmt-preview');
+// Scale a paper-sized preview iframe down to fit its preview pane.
+// Shared by the tenant statement and the income statement modals.
+function _fitPaperPreview(frameId, scaleId, iframeId, paper, orient) {
+  const frame = document.getElementById(frameId);
+  const scaleDiv = document.getElementById(scaleId);
+  const iframe = document.getElementById(iframeId);
   if(!frame || !scaleDiv || !iframe || !frame.clientWidth) return;
-  const o = getStmtOpts();
-  let [w,h] = STMT_PAPER_PX[o.paper] || STMT_PAPER_PX.a4;
-  if(o.orient==='landscape') [w,h] = [h,w];
+  let [w,h] = STMT_PAPER_PX[paper] || STMT_PAPER_PX.a4;
+  if(orient==='landscape') [w,h] = [h,w];
   let contentH = h;
   try {
     const body = iframe.contentDocument && iframe.contentDocument.body;
@@ -454,10 +454,15 @@ function fitStmtPreview() {
   scaleDiv.style.height = Math.ceil(contentH*s)+'px';
 }
 
-function printStatement() {
-  if(!_stmtTenant) return;
-  renderStmtPreview(); // make sure the printed document matches the options
-  const iframe = document.getElementById('stmt-preview');
+function fitStmtPreview() {
+  const o = getStmtOpts();
+  _fitPaperPreview('stmt-preview-frame', 'stmt-preview-scale', 'stmt-preview', o.paper, o.orient);
+}
+
+// Print the document currently rendered in a preview iframe; buildHtml is the
+// fallback when iframe printing is blocked and a pop-up window is used instead.
+function _printPaperDoc(iframeId, buildHtml) {
+  const iframe = document.getElementById(iframeId);
   // Small delay so the freshly written document finishes layout first.
   setTimeout(()=>{
     try {
@@ -468,7 +473,7 @@ function printStatement() {
       try {
         const win = window.open('','_blank');
         if(!win) throw new Error('blocked');
-        win.document.write(buildStatementHTML(_stmtTenant, getStmtOpts()));
+        win.document.write(buildHtml());
         win.document.close();
         setTimeout(()=>{ try { win.print(); } catch(err){} }, 400);
       } catch(err) {
@@ -476,6 +481,465 @@ function printStatement() {
       }
     }
   }, 250);
+}
+
+function printStatement() {
+  if(!_stmtTenant) return;
+  renderStmtPreview(); // make sure the printed document matches the options
+  _printPaperDoc('stmt-preview', ()=>buildStatementHTML(_stmtTenant, getStmtOpts()));
+}
+
+
+// ─────────────────────────────────────────────
+// INCOME STATEMENT — building-wide income vs expenses, printable.
+// Same pattern as the per-tenant statement: options on the left, live paper
+// preview on the right, Print / Save PDF. Income is CASH collected (the
+// dashboard's "Collected" figures, split by bill category), so the statement
+// ties out with the Net Position card month for month.
+// ─────────────────────────────────────────────
+let _incStmtPreset = '6m';       // 'this' | 'last' | '3m' | '6m' | 'ytd' | 'all' | 'custom'
+let _incStmtPreviewTimer = null;
+let _incStmtResizeHandler = null;
+let _incStmtLastStats = null;    // set by buildIncomeStatementHTML; feeds the footer hint
+
+const INCSTMT_PREFS_KEY = 'oa_incstmt_prefs_v1';
+
+function incStmtDefaultPrefs() {
+  return {
+    preset:'6m', incDetail:true, expDetail:true, monthly:true, memo:true,
+    sign:false, note:'', size:'normal', theme:'color', paper:'a4', orient:'portrait'
+  };
+}
+
+function openIncStmtModal() {
+  // A failed expenses load must not print as "₱0 expenses = all profit".
+  if(_expensesLoadError) {
+    showToast('Expenses could not be loaded — refresh the page before generating an income statement.', false);
+    return;
+  }
+  let prefs = incStmtDefaultPrefs();
+  try {
+    const saved = JSON.parse(localStorage.getItem(INCSTMT_PREFS_KEY));
+    if(saved && typeof saved==='object') prefs = Object.assign(prefs, saved);
+  } catch {}
+  const setChk = (id,v)=>{ document.getElementById(id).checked = !!v; };
+  const setVal = (id,v)=>{ document.getElementById(id).value = v; };
+  setChk('incstmt-inc-detail', prefs.incDetail);
+  setChk('incstmt-exp-detail', prefs.expDetail);
+  setChk('incstmt-monthly', prefs.monthly);
+  setChk('incstmt-memo', prefs.memo);
+  setChk('incstmt-sign', prefs.sign);
+  setVal('incstmt-note', prefs.note||'');
+  setVal('incstmt-size', prefs.size);
+  setVal('incstmt-theme', prefs.theme);
+  setVal('incstmt-paper', prefs.paper);
+  setVal('incstmt-orient', prefs.orient);
+  // 'custom' ranges are per-visit; reopen on the default preset instead.
+  setIncStmtPreset(prefs.preset==='custom' ? '6m' : prefs.preset, true);
+  openModal('incstmt-modal');
+  if(!_incStmtResizeHandler) {
+    _incStmtResizeHandler = ()=>fitIncStmtPreview();
+    window.addEventListener('resize', _incStmtResizeHandler);
+  }
+  // Render after the modal is laid out so the preview can measure its width.
+  requestAnimationFrame(()=>renderIncStmtPreview());
+}
+
+function closeIncStmtModal() {
+  closeModalEl('incstmt-modal');
+  if(_incStmtResizeHandler) {
+    window.removeEventListener('resize', _incStmtResizeHandler);
+    _incStmtResizeHandler = null;
+  }
+}
+
+function setIncStmtPreset(preset, skipRender) {
+  _incStmtPreset = preset;
+  document.querySelectorAll('#incstmt-presets .stmt-preset').forEach(btn=>{
+    btn.classList.toggle('active', btn.dataset.preset===preset);
+  });
+  const fromEl = document.getElementById('incstmt-from');
+  const toEl   = document.getElementById('incstmt-to');
+  const ym = d => d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0');
+  const now = new Date();
+  const allTime = preset==='all';
+  fromEl.disabled = allTime;
+  toEl.disabled   = allTime;
+  if(!allTime) {
+    if(preset==='last') {
+      const lm = ym(new Date(now.getFullYear(), now.getMonth()-1, 1));
+      fromEl.value = lm;
+      toEl.value = lm;
+    } else {
+      const back = preset==='6m' ? 5 : preset==='3m' ? 2 : 0;
+      fromEl.value = preset==='ytd' ? now.getFullYear()+'-01' : ym(new Date(now.getFullYear(), now.getMonth()-back, 1));
+      toEl.value = ym(now);
+    }
+  }
+  if(!skipRender) incStmtOptsChanged();
+}
+
+function incStmtRangeEdited() {
+  _incStmtPreset = 'custom';
+  document.querySelectorAll('#incstmt-presets .stmt-preset').forEach(btn=>btn.classList.remove('active'));
+  incStmtOptsChanged();
+}
+
+function getIncStmtOpts() {
+  const chk = id => document.getElementById(id).checked;
+  const val = id => document.getElementById(id).value;
+  return {
+    preset: _incStmtPreset,
+    from: val('incstmt-from'), to: val('incstmt-to'),
+    incDetail: chk('incstmt-inc-detail'), expDetail: chk('incstmt-exp-detail'),
+    monthly: chk('incstmt-monthly'), memo: chk('incstmt-memo'),
+    sign: chk('incstmt-sign'), note: val('incstmt-note'),
+    size: val('incstmt-size'), theme: val('incstmt-theme'),
+    paper: val('incstmt-paper'), orient: val('incstmt-orient')
+  };
+}
+
+function incStmtOptsChanged() {
+  const o = getIncStmtOpts();
+  try {
+    const {from, to, ...prefs} = o; // range is per-visit, everything else persists
+    localStorage.setItem(INCSTMT_PREFS_KEY, JSON.stringify(prefs));
+  } catch {}
+  clearTimeout(_incStmtPreviewTimer);
+  _incStmtPreviewTimer = setTimeout(()=>renderIncStmtPreview(), 120);
+}
+
+// Inclusive list of 'YYYY-MM' keys between two months (order-tolerant).
+// Hard cap of 600 months as a backstop against malformed stored dates.
+function _ymRange(from, to) {
+  const out = [];
+  if(!/^\d{4}-\d{2}$/.test(from) || !/^\d{4}-\d{2}$/.test(to)) return out;
+  if(from > to) { const sw = from; from = to; to = sw; }
+  let [y, m] = from.split('-').map(Number);
+  for(let i = 0; i < 600; i++) {
+    const ym = y+'-'+String(m).padStart(2,'0');
+    out.push(ym);
+    if(ym === to) break;
+    m++; if(m > 12){ m = 1; y++; }
+  }
+  return out;
+}
+
+// Cash that belongs to no month: payment entries without a date, and bills
+// marked paid with no paid date. Ranged periods exclude it (same rule the
+// tenant statement uses for undated bills); "All time" folds it back in.
+function _undatedIncome() {
+  const out = { rent:0, utilities:0, other:0, total:0 };
+  tenants.forEach(t => (t.bills||[]).forEach(b => {
+    const cat = billCategory(b);
+    const payments = b.payments || [];
+    payments.forEach(p => {
+      if(!p.date){ const v = Number(p.amount)||0; out[cat] += v; out.total += v; }
+    });
+    // Residual subtracts ALL logged payments (dated or not), so cash never
+    // double-counts between this bucket and the monthly buckets.
+    if(b.status==='paid' && !b.paidDate){
+      const logged = payments.reduce((s,p)=>s+(Number(p.amount)||0),0);
+      const residual = (Number(b.amount)||0) - logged;
+      if(residual > 0){ out[cat] += residual; out.total += residual; }
+    }
+  }));
+  return out;
+}
+
+// First and last month with any financial activity. Due dates count toward
+// the start (billed-vs-collected covers them); the end extends past the
+// current month only for future-dated cash or expenses. Years before 2000
+// are treated as typos so one bad date can't stretch the doc by decades.
+function _incStmtAllTimeRange() {
+  let min = null, max = null;
+  const spanMin = s => {
+    const ym = String(s||'').slice(0,7);
+    if(!/^\d{4}-\d{2}$/.test(ym) || ym < '2000-01') return;
+    if(!min || ym < min) min = ym;
+  };
+  const spanBoth = s => {
+    const ym = String(s||'').slice(0,7);
+    if(!/^\d{4}-\d{2}$/.test(ym) || ym < '2000-01') return;
+    if(!min || ym < min) min = ym;
+    if(!max || ym > max) max = ym;
+  };
+  tenants.forEach(t => (t.bills||[]).forEach(b => {
+    spanMin(b.due);
+    spanBoth(b.paidDate);
+    (b.payments||[]).forEach(p => spanBoth(p.date));
+  }));
+  expenses.forEach(x => spanBoth(x.expense_date));
+  const cur = _currentYM();
+  return { from: min || cur, to: (max && max > cur) ? max : cur };
+}
+
+function buildIncomeStatementHTML(o) {
+  const bw = o.theme==='bw';
+  const peso = v => '&#8369;'+Number(v||0).toLocaleString();
+  const signedPeso = v => (v<0?'&minus;':'')+'&#8369;'+Math.abs(Number(v)||0).toLocaleString();
+  const fmtM = ym => new Date(ym+'-02').toLocaleString('default',{month:'long',year:'numeric'});
+  const fmtMShort = ym => new Date(ym+'-02').toLocaleString('default',{month:'short',year:'numeric'});
+
+  const allTime = o.preset==='all';
+  let from = o.from, to = o.to;
+  if(allTime) { const r = _incStmtAllTimeRange(); from = r.from; to = r.to; }
+  if(!/^\d{4}-\d{2}$/.test(from||'')) from = _currentYM();
+  if(!/^\d{4}-\d{2}$/.test(to||''))   to = _currentYM();
+  const months = _ymRange(from, to);
+  const rFrom = months[0], rTo = months[months.length-1];
+  const rangeLabel = allTime ? 'All time'
+    : (rFrom===rTo ? fmtM(rFrom) : fmtM(rFrom)+' &ndash; '+fmtM(rTo));
+
+  // Expenses figures are only trustworthy when the ledger exists; a load
+  // error is blocked in openIncStmtModal before we ever get here.
+  const hasExpenses = expensesAvailable && !_expensesLoadError;
+
+  const perMonth = months.map(ym => ({
+    ym,
+    inc: _collectedDetailInMonth(ym),
+    exp: hasExpenses ? _expensesInMonth(ym) : 0
+  }));
+
+  const undated = allTime ? _undatedIncome() : { rent:0, utilities:0, other:0, total:0 };
+  const incCat = { rent:undated.rent, utilities:undated.utilities, other:undated.other };
+  let incTotal = undated.total;
+  perMonth.forEach(m => {
+    incCat.rent += m.inc.rent; incCat.utilities += m.inc.utilities; incCat.other += m.inc.other;
+    incTotal += m.inc.total;
+  });
+
+  const expTotal = perMonth.reduce((s,m)=>s+m.exp,0);
+  const expByCat = {};
+  if(hasExpenses) {
+    let expKnown = 0;
+    EXPENSE_CATEGORIES.forEach(c => {
+      const v = months.reduce((s,ym)=>s+_expenseCatInMonth(ym,c.key),0);
+      expByCat[c.key] = v; expKnown += v;
+    });
+    // Rows imported with a category the app doesn't know still count in the
+    // total — fold the difference into Other so the breakdown adds up.
+    const resid = Math.round((expTotal - expKnown)*100)/100;
+    if(resid > 0.004) expByCat.other += resid;
+  }
+  const net = incTotal - expTotal;
+
+  // Collections memo figures: what was billed for the period, and how much
+  // of the period's billing is still unpaid today.
+  const billedTotal = months.reduce((s,ym)=>s+_billedInMonth(ym),0);
+  let outstanding = 0;
+  tenants.forEach(t => (t.bills||[]).forEach(b => {
+    if(b.status==='paid') return;
+    const ym = (b.due||'').slice(0,7);
+    if(!(allTime || (ym && ym >= rFrom && ym <= rTo))) return;
+    outstanding += Math.max(0, billRemaining(b));
+  }));
+  const rate = billedTotal > 0 ? Math.round(incTotal/billedTotal*100) : null;
+
+  _incStmtLastStats = { incTotal, expTotal, net, hasExpenses };
+
+  // ── Main income / expenses / net table ──
+  const rows = [];
+  rows.push('<tr class="grouphead"><td colspan="2">Income &mdash; payments collected</td></tr>');
+  if(o.incDetail) {
+    rows.push('<tr class="catrow rent"><td>Rent</td><td class="num">'+peso(incCat.rent)+'</td></tr>');
+    if(incCat.utilities) rows.push('<tr class="catrow"><td>Utilities billed back</td><td class="num">'+peso(incCat.utilities)+'</td></tr>');
+    if(incCat.other)     rows.push('<tr class="catrow"><td>Other charges</td><td class="num">'+peso(incCat.other)+'</td></tr>');
+  }
+  rows.push('<tr class="subtotal"><td>Total income</td><td class="num">'+peso(incTotal)+'</td></tr>');
+  if(hasExpenses) {
+    rows.push('<tr class="grouphead"><td colspan="2">Operating expenses</td></tr>');
+    if(o.expDetail) {
+      const nz = EXPENSE_CATEGORIES.filter(c=>expByCat[c.key]>0);
+      if(nz.length) nz.forEach(c => rows.push('<tr class="catrow"><td>'+c.label+'</td><td class="num">'+peso(expByCat[c.key])+'</td></tr>'));
+      else rows.push('<tr class="catrow"><td colspan="2" class="nodata">No expenses recorded in this period.</td></tr>');
+    }
+    rows.push('<tr class="subtotal"><td>Total expenses</td><td class="num">'+peso(expTotal)+'</td></tr>');
+    rows.push('<tr class="netline'+(net<0?' neg':' pos')+'"><td>'+(net<0?'Net loss':'Net income')+'</td><td class="num">'+signedPeso(net)+'</td></tr>');
+  }
+  const mainTable = '<table>'+rows.join('')+'</table>'
+    + (undated.total>0 ? '<div class="tbl-note">Includes '+peso(undated.total)+' received with no recorded payment date.</div>' : '');
+
+  const expNote = !hasExpenses
+    ? '<div class="warn-note">The expenses ledger is not set up yet, so this statement shows income only. Run supabase-migration-2.sql in the Supabase SQL Editor, then log expenses to get a full income statement.</div>'
+    : '';
+
+  // ── Month-by-month table (per-year rows on very long ranges) ──
+  let periodHtml = '';
+  if(o.monthly && perMonth.length > 1) {
+    const byYear = perMonth.length > 24;
+    let prows;
+    if(byYear) {
+      const m2 = new Map();
+      perMonth.forEach(m => {
+        const y = m.ym.slice(0,4);
+        const r = m2.get(y) || { label:y, income:0, exp:0 };
+        r.income += m.inc.total; r.exp += m.exp;
+        m2.set(y, r);
+      });
+      prows = Array.from(m2.values());
+    } else {
+      prows = perMonth.map(m => ({ label: fmtMShort(m.ym), income: m.inc.total, exp: m.exp }));
+    }
+    prows = prows.filter(r => r.income>0 || r.exp>0); // quiet months add nothing
+    if(prows.length) {
+      const datedIncome = incTotal - undated.total;
+      const datedNet = datedIncome - expTotal;
+      periodHtml = '<div class="sec"><div class="sec-label">'+(byYear?'By year':'By month')+'</div>'
+        + '<table class="ptable"><thead><tr><th>'+(byYear?'Year':'Month')+'</th><th class="num">Income</th>'
+        + (hasExpenses ? '<th class="num">Expenses</th><th class="num">Net</th>' : '')+'</tr></thead><tbody>'
+        + prows.map(r => {
+            const n = r.income - r.exp;
+            return '<tr><td>'+r.label+'</td><td class="num">'+peso(r.income)+'</td>'
+              + (hasExpenses ? '<td class="num">'+peso(r.exp)+'</td><td class="num'+(n<0?' neg':'')+'">'+signedPeso(n)+'</td>' : '')
+              + '</tr>';
+          }).join('')
+        + '<tr class="subtotal"><td>Total</td><td class="num">'+peso(datedIncome)+'</td>'
+        + (hasExpenses ? '<td class="num">'+peso(expTotal)+'</td><td class="num'+(datedNet<0?' neg':'')+'">'+signedPeso(datedNet)+'</td>' : '')
+        + '</tr></tbody></table>'
+        + (undated.total>0 ? '<div class="tbl-note">Undated payments ('+peso(undated.total)+') belong to no month and are not in this table.</div>' : '')
+        + '</div>';
+    }
+  }
+
+  const memoHtml = o.memo
+    ? '<div class="sec"><div class="sec-label">Collections memo</div>'
+      + '<table class="ptable memo-table"><tbody>'
+      + '<tr><td>Billed to tenants in period</td><td class="num">'+peso(billedTotal)+'</td></tr>'
+      + '<tr><td>Collected in period</td><td class="num">'+peso(incTotal)+'</td></tr>'
+      + (rate!==null ? '<tr><td>Collection rate</td><td class="num">'+rate+'%</td></tr>' : '')
+      + '<tr><td>Still unpaid on bills '+(allTime?'to date':'due in this period')+'</td><td class="num">'+peso(outstanding)+'</td></tr>'
+      + '</tbody></table>'
+      + '<div class="tbl-note">&ldquo;Collected&rdquo; counts every payment received in the period, including payments settling bills from earlier months'
+      + (rate!==null && rate>100 ? ' &mdash; that is why the rate can exceed 100%' : '')+'.</div>'
+      + '</div>'
+    : '';
+
+  const noteHtml = (o.note||'').trim()
+    ? '<div class="notes"><div class="sec-label">Notes</div><div class="notes-body">'+esc(o.note.trim()).replace(/\n/g,'<br>')+'</div></div>'
+    : '';
+
+  const signHtml = o.sign
+    ? '<div class="signs">'
+      + '<div class="sign"><div class="sign-line"></div><div class="sign-label">Prepared by &middot; Date</div></div>'
+      + '<div class="sign"><div class="sign-line"></div><div class="sign-label">Noted by &middot; Date</div></div>'
+      + '</div>'
+    : '';
+
+  const genDate = new Date().toLocaleDateString('en-PH',{month:'long',day:'numeric',year:'numeric'});
+  const headVal = hasExpenses ? net : incTotal;
+  const headLabel = hasExpenses ? (net<0 ? 'Net Loss' : 'Net Income') : 'Total Income';
+  const headColor = bw ? '#111111' : (headVal < 0 ? '#c0392b' : '#1e8449');
+  const headHtml = '<div class="head-bal" style="color:'+headColor+'">'+signedPeso(headVal)+'</div>';
+
+  const sizes = {
+    compact:{ base:'10.5px', pad:'5px 8px',  h1:'19px', bal:'17px' },
+    normal: { base:'12px',   pad:'7px 9px',  h1:'21px', bal:'19px' },
+    large:  { base:'13.5px', pad:'9px 10px', h1:'23px', bal:'21px' }
+  };
+  const sz = sizes[o.size]||sizes.normal;
+  const accent = bw ? '#111111' : '#e67e22';
+  const headings = bw ? '#111111' : '#2c3e50';
+  const theadBg = bw ? '#f2f2f2' : '#f1f5f9';
+  const muted = bw ? '#444444' : '#5a6776';
+  const green = bw ? '#111111' : '#1e8449';
+  const red   = bw ? '#111111' : '#c0392b';
+  const pageSize = (o.paper==='letter'?'letter':'A4')+' '+(o.orient==='landscape'?'landscape':'portrait');
+
+  const css =
+    '*{margin:0;padding:0;box-sizing:border-box}'+
+    'body{font-family:Inter,Arial,Helvetica,sans-serif;color:#111;font-size:'+sz.base+';line-height:1.5;-webkit-print-color-adjust:exact;print-color-adjust:exact}'+
+    '.doc{padding:44px 48px;max-width:1040px;margin:0 auto}'+
+    '.doc-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;padding-bottom:14px;border-bottom:2.5px solid '+headings+';margin-bottom:18px}'+
+    '.brand{font-family:"Source Serif 4",Georgia,serif;font-size:'+sz.h1+';font-weight:700;color:'+headings+';display:flex;align-items:center;gap:9px}'+
+    '.brand .dot{width:0.55em;height:0.55em;border-radius:50%;background:'+accent+';display:inline-block;flex-shrink:0}'+
+    '.brand-sub{font-size:0.72em;font-weight:400;color:'+muted+';font-family:Inter,Arial,sans-serif;margin-top:3px;letter-spacing:0.02em}'+
+    '.doc-type{text-align:right}'+
+    '.doc-type-title{font-size:0.95em;font-weight:600;letter-spacing:0.14em;text-transform:uppercase;color:'+headings+'}'+
+    '.doc-type-gen{font-size:0.88em;color:'+muted+';margin-top:4px}'+
+    '.doc-meta{display:flex;justify-content:space-between;gap:20px;margin-bottom:20px}'+
+    '.meta-label{font-size:0.78em;font-weight:600;letter-spacing:0.12em;text-transform:uppercase;color:'+muted+';margin-bottom:3px}'+
+    '.meta-main{font-weight:600;color:#111}'+
+    '.meta-sub{font-size:0.92em;color:'+muted+';margin-top:1px}'+
+    '.meta-block.right{text-align:right}'+
+    '.head-bal{font-family:"Source Serif 4",Georgia,serif;font-size:'+sz.bal+';font-weight:700}'+
+    'table{width:100%;border-collapse:collapse}'+
+    'thead{display:table-header-group}'+
+    'th{background:'+theadBg+';padding:'+sz.pad+';text-align:left;font-size:0.82em;letter-spacing:0.08em;text-transform:uppercase;color:'+muted+';border-bottom:1.5px solid #d5d9e0}'+
+    'td{padding:'+sz.pad+';border-bottom:1px solid #e8e8ed;vertical-align:top}'+
+    'tr{page-break-inside:avoid}'+
+    '.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}'+
+    '.grouphead td{background:'+(bw?'#fafafa':'#fbf7f2')+';font-family:"Source Serif 4",Georgia,serif;font-weight:600;color:'+headings+';border-bottom:1px solid #d5d9e0;padding-top:0.9em}'+
+    '.catrow td:first-child{color:'+muted+';padding-left:1.6em}'+
+    '.catrow.rent td{color:#111;font-weight:600}'+
+    '.catrow .nodata{color:'+muted+';font-style:italic}'+
+    '.subtotal td{font-weight:700;background:'+(bw?'#fafafa':'#fcfcfd')+';border-bottom:2px solid #d5d9e0;color:'+headings+'}'+
+    '.netline td{font-family:"Source Serif 4",Georgia,serif;font-weight:700;font-size:1.12em;border-bottom:3px double '+headings+';padding-top:0.85em}'+
+    '.netline.pos td.num{color:'+green+'}'+
+    '.netline.neg td.num{color:'+red+'}'+
+    '.sec{margin-top:24px;page-break-inside:avoid}'+
+    '.sec-label{font-size:0.78em;font-weight:600;letter-spacing:0.12em;text-transform:uppercase;color:'+muted+';margin-bottom:6px}'+
+    '.ptable td.neg,.ptable td.num.neg{color:'+red+';font-weight:600}'+
+    '.memo-table td:first-child{color:'+muted+'}'+
+    '.tbl-note{font-size:0.88em;color:'+muted+';margin-top:6px;line-height:1.55}'+
+    '.warn-note{margin-top:16px;padding:12px 16px;background:'+(bw?'#f7f7f7':'#fffbeb')+';border-left:3px solid '+accent+';font-size:0.95em;line-height:1.6;color:#111;page-break-inside:avoid}'+
+    '.notes{margin-top:22px;padding:12px 16px;background:'+(bw?'#f7f7f7':'#f8f9fc')+';border-left:3px solid '+accent+';page-break-inside:avoid}'+
+    '.notes-body{white-space:normal}'+
+    '.signs{display:flex;gap:48px;margin-top:44px;page-break-inside:avoid}'+
+    '.sign{flex:1;max-width:260px}'+
+    '.sign-line{border-bottom:1.5px solid #111;height:2.2em}'+
+    '.sign-label{font-size:0.85em;color:'+muted+';margin-top:5px}'+
+    '.doc-foot{margin-top:28px;padding-top:10px;border-top:1px solid #e8e8ed;display:flex;justify-content:space-between;font-size:0.82em;color:'+muted+'}'+
+    '@page{size:'+pageSize+';margin:14mm}'+
+    '@media print{.doc{padding:0;max-width:none}}';
+
+  return '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Income Statement — '+esc(propertyName)+'</title>'+
+    '<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,600;8..60,700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">'+
+    '<style>'+css+'</style></head><body><div class="doc">'+
+    '<div class="doc-head">'+
+      '<div><div class="brand"><span class="dot"></span>'+esc(propertyName)+'</div><div class="brand-sub">'+esc(propertySubtitle)+'</div></div>'+
+      '<div class="doc-type"><div class="doc-type-title">Income Statement</div><div class="doc-type-gen">Generated '+genDate+'</div></div>'+
+    '</div>'+
+    '<div class="doc-meta">'+
+      '<div class="meta-block"><div class="meta-label">Property</div><div class="meta-main">'+esc(propertyName)+'</div><div class="meta-sub">'+esc(propertySubtitle)+'</div></div>'+
+      '<div class="meta-block"><div class="meta-label">Period</div><div class="meta-main">'+rangeLabel+'</div><div class="meta-sub">'+months.length+' month'+(months.length!==1?'s':'')+'</div></div>'+
+      '<div class="meta-block right"><div class="meta-label">'+headLabel+'</div>'+headHtml+'</div>'+
+    '</div>'+
+    mainTable + expNote + periodHtml + memoHtml + noteHtml + signHtml +
+    '<div class="doc-foot"><span>'+esc(propertyName)+' &middot; Income Statement</span><span>'+rangeLabel+'</span></div>'+
+    '</div></body></html>';
+}
+
+function renderIncStmtPreview() {
+  const iframe = document.getElementById('incstmt-preview');
+  if(!iframe) return;
+  const o = getIncStmtOpts();
+  const html = buildIncomeStatementHTML(o);
+  const doc = iframe.contentDocument || iframe.contentWindow.document;
+  doc.open(); doc.write(html); doc.close();
+
+  // Footer hint mirrors the headline numbers on the statement.
+  const s = _incStmtLastStats;
+  const hint = document.getElementById('incstmt-hint');
+  if(hint && s) {
+    const p = v => '&#8369;'+Math.abs(v).toLocaleString();
+    hint.innerHTML = s.hasExpenses
+      ? p(s.incTotal)+' income &middot; '+p(s.expTotal)+' expenses &middot; net '+(s.net<0?'&minus;':'')+p(s.net)
+      : p(s.incTotal)+' income &middot; expenses ledger not set up';
+  }
+  fitIncStmtPreview();
+  // Re-fit once content (and web fonts) settle so the page height is right.
+  setTimeout(fitIncStmtPreview, 120);
+}
+
+function fitIncStmtPreview() {
+  const o = getIncStmtOpts();
+  _fitPaperPreview('incstmt-preview-frame', 'incstmt-preview-scale', 'incstmt-preview', o.paper, o.orient);
+}
+
+function printIncomeStatement() {
+  renderIncStmtPreview(); // make sure the printed document matches the options
+  _printPaperDoc('incstmt-preview', ()=>buildIncomeStatementHTML(getIncStmtOpts()));
 }
 
 
@@ -1028,6 +1492,7 @@ async function logout() {
   filterStatuses = [];
   filterSearch   = '';
   _openPaid      = new Set();
+  _settingsOpen  = false;
   sortOrder      = 'unit-asc';
   groupMode      = 'auto';
   viewMode       = 'card';
@@ -1089,9 +1554,30 @@ function renderActionRequired() {
 
 // ─────────────────────────────────────────────
 // INSIGHTS PANEL (admin only)
-let _insightsOpen = true;
+// Phones start with the panel collapsed — the tenant list is the working
+// area there and the charts pushed it a long scroll away. An explicit
+// open/close choice is remembered on the device either way.
+const INSIGHTS_OPEN_KEY = 'oa_insights_open';
+let _insightsOpen = (function(){
+  try {
+    const v = localStorage.getItem(INSIGHTS_OPEN_KEY);
+    if(v === '1') return true;
+    if(v === '0') return false;
+  } catch {}
+  return window.innerWidth > 768;
+})();
 function toggleInsights() {
   _insightsOpen = !_insightsOpen;
+  try { localStorage.setItem(INSIGHTS_OPEN_KEY, _insightsOpen ? '1' : '0'); } catch {}
+  rerenderAdmin();
+}
+
+// Settings cards (payment instructions / announcements / property) collapse
+// behind one toggle on phones; on desktop the toggle is hidden by CSS and
+// the cards are always visible.
+let _settingsOpen = false;
+function toggleSettingsCards() {
+  _settingsOpen = !_settingsOpen;
   rerenderAdmin();
 }
 // The panel leads with Key Findings — computed, plain-language sentences
@@ -1125,18 +1611,27 @@ function _last6Months() {
 // marked paid in M — whatever part of the amount is NOT covered by logged
 // payments (the remainder settled at mark-paid time). This also covers legacy
 // bills with no payment log at all (remainder = full amount).
-function _collectedInMonth(ym) {
-  let total = 0;
+// The detail variant splits the same cash by bill category so the income
+// statement can print Rent / Utilities / Other lines that sum to the exact
+// figures the dashboard shows.
+function _collectedDetailInMonth(ym) {
+  const out = { rent:0, utilities:0, other:0, total:0 };
   tenants.forEach(t => (t.bills||[]).forEach(b => {
+    const cat = billCategory(b);
     const payments = b.payments || [];
-    payments.forEach(p => { if(p.date && String(p.date).startsWith(ym)) total += Number(p.amount)||0; });
+    payments.forEach(p => {
+      if(p.date && String(p.date).startsWith(ym)){ const v = Number(p.amount)||0; out[cat] += v; out.total += v; }
+    });
     if(b.status==='paid' && b.paidDate && String(b.paidDate).startsWith(ym)){
       const logged = payments.reduce((s,p)=>s+(Number(p.amount)||0),0);
       const residual = (Number(b.amount)||0) - logged;
-      if(residual > 0) total += residual;
+      if(residual > 0){ out[cat] += residual; out.total += residual; }
     }
   }));
-  return total;
+  return out;
+}
+function _collectedInMonth(ym) {
+  return _collectedDetailInMonth(ym).total;
 }
 function _billedInMonth(ym) {
   let total = 0;
@@ -1234,6 +1729,15 @@ function insightFilter(o) {
   filterSearch   = '';
   filterStatuses = o.statuses || [];
   applyFilters();
+  // On phones the tenant list sits ABOVE the insights panel (mobile reorder),
+  // so a tap here would otherwise filter a list that is entirely off-screen
+  // and appear to do nothing. Jump up to the list — but only when it really
+  // is above the viewport, so desktop behavior is untouched. Double-RAF runs
+  // after rerenderAdmin's own scroll restore.
+  requestAnimationFrame(()=>requestAnimationFrame(()=>{
+    const bar = document.querySelector('.section-bar');
+    if(bar && bar.getBoundingClientRect().bottom < 0) bar.scrollIntoView({behavior:'smooth', block:'start'});
+  }));
 }
 
 // The digest behind the "Key Findings" card. Charts show data; these
@@ -1902,31 +2406,36 @@ function renderAdmin() {
     </div>
     ${renderInsights()}
     ${renderExpensesPanel()}
-    <div class="settings-cards">
-      <div class="pay-inst-card">
-        <div class="pay-inst-head">
-          <div class="pay-inst-label">&#128176; Payment Instructions</div>
-          <button class="btn-pay-inst-edit" onclick="openPayInstModal()">Edit</button>
+    <div class="settings-panel" id="settings-panel">
+      <button class="insights-toggle settings-toggle" onclick="toggleSettingsCards()" aria-expanded="${_settingsOpen?'true':'false'}">
+        <span class="insights-arrow${_settingsOpen?' open':''}">›</span> Portal Settings <span class="exp-head-sub">payment info · announcements · property</span>
+      </button>
+      <div class="settings-cards${_settingsOpen?' open':''}">
+        <div class="pay-inst-card">
+          <div class="pay-inst-head">
+            <div class="pay-inst-label">&#128176; Payment Instructions</div>
+            <button class="btn-pay-inst-edit" onclick="openPayInstModal()">Edit</button>
+          </div>
+          ${paymentInstructions
+            ? `<div class="pay-inst-preview">${esc(paymentInstructions)}</div>`
+            : `<div class="pay-inst-empty">Not set — tenants will not see payment instructions.</div>`}
         </div>
-        ${paymentInstructions
-          ? `<div class="pay-inst-preview">${esc(paymentInstructions)}</div>`
-          : `<div class="pay-inst-empty">Not set — tenants will not see payment instructions.</div>`}
-      </div>
-      <div class="pay-inst-card">
-        <div class="pay-inst-head">
-          <div class="pay-inst-label">&#128226; Announcements</div>
-          <button class="btn-pay-inst-edit" onclick="openAnnounceModal()">Edit</button>
+        <div class="pay-inst-card">
+          <div class="pay-inst-head">
+            <div class="pay-inst-label">&#128226; Announcements</div>
+            <button class="btn-pay-inst-edit" onclick="openAnnounceModal()">Edit</button>
+          </div>
+          ${announcements
+            ? `<div class="pay-inst-preview">${esc(announcements)}</div>`
+            : `<div class="pay-inst-empty">Not set — the tenant notice board is hidden.</div>`}
         </div>
-        ${announcements
-          ? `<div class="pay-inst-preview">${esc(announcements)}</div>`
-          : `<div class="pay-inst-empty">Not set — the tenant notice board is hidden.</div>`}
-      </div>
-      <div class="pay-inst-card">
-        <div class="pay-inst-head">
-          <div class="pay-inst-label">&#127968; Property</div>
-          <button class="btn-pay-inst-edit" onclick="openBrandingModal()">Edit</button>
+        <div class="pay-inst-card">
+          <div class="pay-inst-head">
+            <div class="pay-inst-label">&#127968; Property</div>
+            <button class="btn-pay-inst-edit" onclick="openBrandingModal()">Edit</button>
+          </div>
+          <div class="pay-inst-preview">${esc(propertyName)}<span style="color:var(--muted)"> · ${esc(propertySubtitle)}</span></div>
         </div>
-        <div class="pay-inst-preview">${esc(propertyName)}<span style="color:var(--muted)"> · ${esc(propertySubtitle)}</span></div>
       </div>
     </div>
     ${renderActionRequired()}
@@ -1940,6 +2449,7 @@ function renderAdmin() {
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn-generate" onclick="exportCSV()" title="Export all bills to CSV">&#128190; Export CSV</button>
+        <button class="btn-generate" onclick="openIncStmtModal()" title="Printable income statement — collections vs expenses">&#128200; Income Statement</button>
         <button class="btn-generate" onclick="openGenModal()">&#128197; Generate Bills</button>
         <button class="btn-generate" onclick="openAddModal()">+ Add Tenant</button>
         <button class="btn-add" onclick="openQuickBill()">+ Add Bill</button>
@@ -2010,7 +2520,7 @@ function renderAdmin() {
       </div>
       <div id="tenant-rows"></div>
     </div>`:'<div id="tenant-rows"></div>'}
-    <div style="margin-top:24px;">
+    <div class="archived-section" style="margin-top:24px;">
       <button class="admin-paid-toggle" style="font-size:11px;font-weight:600;color:var(--muted);letter-spacing:0.1em;text-transform:uppercase;" onclick="this.nextElementSibling.classList.toggle('open');this.querySelector('.admin-paid-arrow').classList.toggle('open');if(this.nextElementSibling.classList.contains('open'))loadArchivedTenants();">
         <span class="admin-paid-arrow">›</span>&nbsp; Archived Tenants
       </button>
@@ -3545,6 +4055,7 @@ document.addEventListener('DOMContentLoaded',()=>{
   _wire('announce-modal', closeAnnounceModal);
   _wire('branding-modal', closeBrandingModal);
   _wire('stmt-modal',    closeStmtModal);
+  _wire('incstmt-modal', closeIncStmtModal);
   _wire('genbills-modal', closeGenModal);
   _wire('addbill-modal', closeQuickBill);
 
@@ -4476,6 +4987,7 @@ document.addEventListener('keydown', function(e) {
   if(_el('announce-modal')) { closeAnnounceModal();return; }
   if(_el('branding-modal')) { closeBrandingModal();return; }
   if(_el('stmt-modal'))     { closeStmtModal();    return; }
+  if(_el('incstmt-modal'))  { closeIncStmtModal(); return; }
   if(_el('addbill-modal'))  { closeQuickBill();    return; }
   if(_el('tenant-modal'))   { closeModal();        return; }
 });
@@ -4485,7 +4997,7 @@ document.addEventListener('keydown', function(e) {
 // aria-modal, but without this the background stayed keyboard-reachable —
 // Tab could land on (and activate) destructive controls behind the overlay.
 // ─────────────────────────────────────────────
-const _MODAL_IDS = ['paiddate-modal','genbills-modal','payinst-modal','announce-modal','branding-modal','stmt-modal','addbill-modal','tenant-modal'];
+const _MODAL_IDS = ['paiddate-modal','genbills-modal','payinst-modal','announce-modal','branding-modal','stmt-modal','incstmt-modal','addbill-modal','tenant-modal'];
 document.addEventListener('keydown', function(e) {
   if(e.key !== 'Tab') return;
   let openEl = null;
